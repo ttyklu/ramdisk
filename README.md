@@ -4,8 +4,8 @@ A hardware NVMe controller for the ZC706 that serves a namespace out of DDR3. No
 firmware is involved: admin and I/O commands are handled entirely in the FPGA fabric.
 Compression and the two-phase write come later and plug into the data path.
 
-**Status:** written but **never compiled or simulated**. The machine it was written on
-has no Verilog tools, so expect a first round of compile fixes in Vivado xsim.
+**Status:** RTL compiles cleanly and the self-checking testbench passes in both Vivado xsim
+2026.1 and Verilator 5.032 (50/50 random seeds). Not yet tried on hardware.
 
 ## What is implemented
 
@@ -66,6 +66,16 @@ cd ~/ramdisk/sim
 ./run_xsim.sh          # batch; prints TEST PASSED / TEST FAILED
 ./run_xsim.sh waves    # also records waves.wdb (open with: xsim waves.wdb -gui)
 ./run_xsim.sh gui      # interactive
+```
+
+Or with Verilator (5.x, uses `--timing`):
+
+```bash
+cd ~/ramdisk/sim
+./run_verilator.sh            # build + run; prints TEST PASSED / TEST FAILED
+./run_verilator.sh waves      # also dumps waves.vcd (open with: gtkwave waves.vcd)
+./run_verilator.sh seeds 50   # run 50 random seeds
+SEED=7 ./run_verilator.sh     # one specific seed
 ```
 
 The testbench brings the controller up the way the Linux `nvme` driver does (CAP/VS reads,

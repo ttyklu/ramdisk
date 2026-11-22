@@ -72,14 +72,18 @@ module tb_top;
   bit [31:0] hmem [bit [63:0]];    // key = byte address >> 2
 
   function automatic bit [31:0] hr32a(input bit [63:0] a);      // a is DW aligned
-    return hmem.exists(a >> 2) ? hmem[a >> 2] : 32'd0;
+    bit [63:0] k;
+    k = a >> 2;
+    return hmem.exists(k) ? hmem[k] : 32'd0;
   endfunction
   function automatic bit [7:0] hr8(input bit [63:0] a);
-    bit [31:0] w = hr32a({a[63:2], 2'b00});
+    bit [31:0] w;
+    w = hr32a({a[63:2], 2'b00});
     return w[a[1:0]*8 +: 8];
   endfunction
   function automatic void hw8(input bit [63:0] a, input bit [7:0] v);
-    bit [31:0] w = hr32a({a[63:2], 2'b00});
+    bit [31:0] w;
+    w = hr32a({a[63:2], 2'b00});
     w[a[1:0]*8 +: 8] = v;
     hmem[a >> 2] = w;
   endfunction
@@ -116,9 +120,11 @@ module tb_top;
 
   // push a TLP given as a DW list
   function automatic void push_tlp(input bit [31:0] dws[$], input bit [21:0] u);
-    int n = dws.size();
+    int n;
+    n = dws.size();
     for (int i = 0; i < n; i += 2) begin
-      bit last = (i + 2 >= n);
+      bit last;
+      last = (i + 2 >= n);
       if (i + 1 < n) push_beat({dws[i+1], dws[i]}, 8'hFF, last, u);
       else           push_beat({32'd0,    dws[i]}, 8'h0F, last, u);
     end
@@ -149,6 +155,7 @@ module tb_top;
 
   task automatic mmio_write32(input bit [31:0] off, input bit [31:0] data);
     bit [31:0] t[$];
+    t.delete();
     t.push_back(mk_h0(FMT_3DW_D, TLP_T_MEM, 3'd0, 2'd0, 10'd1));
     t.push_back({16'h0000, 8'h00, 4'h0, 4'hF});
     t.push_back(BAR0 + off);
@@ -159,6 +166,7 @@ module tb_top;
 
   task automatic mmio_write64(input bit [31:0] off, input bit [63:0] data);
     bit [31:0] t[$];
+    t.delete();
     t.push_back(mk_h0(FMT_3DW_D, TLP_T_MEM, 3'd0, 2'd0, 10'd2));
     t.push_back({16'h0000, 8'h00, 4'hF, 4'hF});
     t.push_back(BAR0 + off);
@@ -172,6 +180,7 @@ module tb_top;
     bit [31:0] t[$];
     bit [7:0]  tag;
     int        to;
+    t.delete();
     tag = mmio_tag++;
     mmio_done[tag] = 1'b0;
     t.push_back(mk_h0(FMT_3DW_ND, TLP_T_MEM, 3'd0, 2'd0, 10'd1));
@@ -181,7 +190,8 @@ module tb_top;
     to = 0;
     while (!mmio_done[tag]) begin
       @(posedge clk);
-      if (++to > 10000) begin fail($sformatf("MMIO read timeout off=%h", off)); break; end
+      to++;
+      if (to > 10000) begin fail($sformatf("MMIO read timeout off=%h", off)); break; end
     end
     data = mmio_rdata[tag];
   endtask
@@ -205,6 +215,7 @@ module tb_top;
     bit [4:0]  typ;
     int        len, hdr;
     bit [63:0] addr;
+    dw.delete();
     foreach (txb[i]) begin dw.push_back(txb[i][31:0]); dw.push_back(txb[i][63:32]); end
     h0  = dw[0];
     h1  = dw[1];
@@ -222,20 +233,24 @@ module tb_top;
         if ((addr & 64'hFFF) + len * 4 > 4096) fail($sformatf("MWr crosses 4KB: addr=%h len=%0d", addr, len));
         if (len > 32) fail($sformatf("MWr payload %0d DW > 128 B", len));
         if (addr >= MSI_ADDR && addr < MSI_ADDR + 64'h1000) begin
-          bit [31:0] d = ax(dw[hdr]);
+          bit [31:0] d;
+          d = ax(dw[hdr]);
           if (d < NV) msi_cnt[d]++;
           else fail($sformatf("MSI-X data %h out of range", d));
         end else begin
           for (int i = 0; i < len; i++) begin
-            bit [31:0] d = ax(dw[hdr + i]);
-            bit [3:0]  be = (i == 0) ? h1[3:0] : (i == len - 1) ? h1[7:4] : 4'hF;
+            bit [31:0] d;
+            bit [3:0]  be;
+            d  = ax(dw[hdr + i]);
+            be = (i == 0) ? h1[3:0] : (i == len - 1) ? h1[7:4] : 4'hF;
             if (be == 4'hF) hw32(addr + i*4, d);
             else for (int b = 0; b < 4; b++) if (be[b]) hw8(addr + i*4 + b, d[b*8 +: 8]);
           end
         end
       end else begin
         // MRd
-        bit [7:0] tag = h1[15:8];
+        bit [7:0] tag;
+        tag = h1[15:8];
         n_mrd++;
         if (len > 32) fail($sformatf("MRd length %0d > 32 DW", len));
         if ((addr & 64'h7F) + len * 4 > 128) fail($sformatf("MRd crosses 128 B: addr=%h len=%0d", addr, len));
@@ -247,7 +262,8 @@ module tb_top;
         pend_rid.push_back(h1[31:16]);
       end
     end else if (typ == TLP_T_CPL) begin
-      bit [7:0] tag = dw[2][15:8];
+      bit [7:0] tag;
+      tag = dw[2][15:8];
       if (h1[15:13] != 3'b000) fail($sformatf("register read completion status %b", h1[15:13]));
       mmio_rdata[tag] = (fmt[1]) ? ax(dw[3]) : 32'hFFFF_FFFF;
       mmio_done[tag]  = 1'b1;
@@ -274,12 +290,15 @@ module tb_top;
   // completion scheduler: random pending read, next chunk (RCB = 64 B), CplD to device
   always @(posedge clk) begin
     if (!rst && pend_tag.size() > 0 && rxq_d.size() < 32 && $urandom_range(0, 2) == 0) begin
-      automatic int        i   = $urandom_range(0, pend_tag.size() - 1);
-      automatic bit [63:0] a   = pend_addr[i];
-      automatic int        rem = pend_rem[i];
-      automatic int        bnd = 64 - int'(a % 64);
-      automatic int        nb  = (rem < bnd || $urandom_range(0, 3) == 0) ? rem : bnd;  // sometimes whole
-      automatic bit [31:0] t[$];
+      int        i, rem, bnd, nb;
+      bit [63:0] a;
+      bit [31:0] t[$];
+      t.delete();
+      i   = $urandom_range(0, pend_tag.size() - 1);
+      a   = pend_addr[i];
+      rem = pend_rem[i];
+      bnd = 64 - int'(a % 64);
+      nb  = (rem < bnd || $urandom_range(0, 3) == 0) ? rem : bnd;  // sometimes whole
       t.push_back(mk_h0(FMT_3DW_D, TLP_T_CPL, 3'd0, 2'd0, 10'(nb / 4)));
       t.push_back({16'h0000, 3'b000, 1'b0, 12'(rem)});
       t.push_back({pend_rid[i], pend_tag[i], 1'b0, a[6:0]});
@@ -325,7 +344,8 @@ module tb_top;
   task automatic wait_cqe(input int q, input bit [15:0] cid, output bit [31:0] dw0, output bit [14:0] st);
     bit [63:0] a;
     bit [31:0] d2, d3;
-    int        to = 0;
+    int        to;
+    to = 0;
     a  = cq_base[q] + 64'(cq_head[q] * 16);
     d3 = hr32(a + 12);
     while (d3[16] != cq_ph[q]) begin
@@ -348,13 +368,13 @@ module tb_top;
   int cq_of_sq[NQ+1];
   task automatic run_cmd(input int q, input sqe_t c, output bit [31:0] dw0, output bit [14:0] st);
     bit [15:0] cid;
-    int        v, before;
+    int        v, msi_before;
     v      = cq_vec[cq_of_sq[q]];
-    before = msi_cnt[v];
+    msi_before = msi_cnt[v];
     submit(q, c, cid);
     wait_cqe(cq_of_sq[q], cid, dw0, st);
     repeat (100) @(posedge clk);
-    if (msi_cnt[v] == before) fail($sformatf("no MSI-X on vector %0d for q=%0d", v, q));
+    if (msi_cnt[v] == msi_before) fail($sformatf("no MSI-X on vector %0d for q=%0d", v, q));
   endtask
 
   // ---------------- PRP construction ----------------
@@ -364,7 +384,8 @@ module tb_top;
   // Lay out a transfer of nbytes starting at page offset off1; returns PRP1/PRP2
   task automatic build_prp(input bit [63:0] region, input int nbytes, input int off1,
                            output bit [63:0] prp1, output bit [63:0] prp2);
-    int n = (off1 + nbytes + 4095) / 4096;
+    int n;
+    n = (off1 + nbytes + 4095) / 4096;
     pages.delete();
     for (int i = 0; i < n; i++) pages.push_back(region + 64'(((i * 37 + 5) % 64) * 4096));
     prp1 = pages[0] + off1;
@@ -372,14 +393,17 @@ module tb_top;
     if (n == 2) prp2 = pages[1];
     else if (n > 2) begin
       bit [63:0] la;
-      int        left = n - 1;
-      int        k    = 1;
+      int        left;
+      int        k;
+      left = n - 1;
+      k    = 1;
       la   = list_pool + 64'(4096 - 8 * $urandom_range(1, 40));   // often forces chaining
       list_pool += 64'h1_0000;
       prp2 = la;
       while (left > 0) begin
         if ((la % 4096) == 4088 && left > 1) begin
-          bit [63:0] nxt = list_pool;
+          bit [63:0] nxt;
+          nxt = list_pool;
           list_pool += 64'h1_0000;
           hw64(la, nxt);
           la = nxt;
@@ -393,7 +417,8 @@ module tb_top;
   endtask
 
   function automatic bit [63:0] xaddr(input int off1, input int j);
-    int jj = off1 + j;
+    int jj;
+    jj = off1 + j;
     return pages[jj / 4096] + 64'(jj % 4096);
   endfunction
 
@@ -405,10 +430,12 @@ module tb_top;
     sqe_t      c;
     bit [31:0] dw0;
     bit [14:0] st;
-    int        nbytes = nblk * 4096;
+    int        nbytes;
+    nbytes = nblk * 4096;
     build_prp(64'h0000_0000_2000_0000 + 64'($urandom_range(0, 15)) * 64'h10_0000, nbytes, off1, p1, p2);
     for (int j = 0; j < nbytes / 4; j++) begin
-      bit [31:0] d = $urandom;
+      bit [31:0] d;
+      d = $urandom;
       hw32(xaddr(off1, j * 4), d);
       disk[slba * 1024 + j] = d;
     end
@@ -424,8 +451,9 @@ module tb_top;
     sqe_t      c;
     bit [31:0] dw0;
     bit [14:0] st;
-    int        nbytes = nblk * 4096;
-    int        bad    = 0;
+    int        nbytes, bad;
+    nbytes = nblk * 4096;
+    bad    = 0;
     build_prp(64'h0000_0001_8000_0000 + 64'($urandom_range(0, 15)) * 64'h10_0000, nbytes, off1, p1, p2);
     for (int j = 0; j < nbytes / 4; j++) hw32(xaddr(off1, j * 4), 32'hA5A5_A5A5);
     c = new_cmd(8'h02, 32'd1);
@@ -434,8 +462,11 @@ module tb_top;
     run_cmd(q, c, dw0, st);
     if (st != 0) fail($sformatf("READ q=%0d lba=%0d n=%0d status=%h", q, slba, nblk, st));
     for (int j = 0; j < nbytes / 4; j++) begin
-      bit [31:0] exp = disk.exists(slba * 1024 + j) ? disk[slba * 1024 + j] : 32'd0;
-      bit [31:0] got = hr32(xaddr(off1, j * 4));
+      bit [31:0] exp, got;
+      bit [63:0] k;
+      k   = slba * 1024 + 64'(j);
+      exp = disk.exists(k) ? disk[k] : 32'd0;
+      got = hr32(xaddr(off1, j * 4));
       if (got != exp) begin
         if (bad < 5) fail($sformatf("READ data lba=%0d dw=%0d got=%h exp=%h (off1=%0d n=%0d)",
                                     slba + j / 1024, j % 1024, got, exp, off1, nblk));
@@ -449,8 +480,9 @@ module tb_top;
     bit [31:0] r, dw0;
     bit [14:0] st;
     sqe_t      c;
-    bit [63:0] idbuf = 64'h0000_0000_3000_0000;
+    bit [63:0] idbuf;
     bit [15:0] cid;
+    idbuf = 64'h0000_0000_3000_0000;
 
     rst = 1'b1;
     repeat (20) @(posedge clk);
@@ -627,6 +659,14 @@ module tb_top;
     if (errors == 0) $display("TEST PASSED");
     else             $display("TEST FAILED (%0d errors)", errors);
     $finish;
+  end
+
+  // optional waveform dump: run with +vcd (Verilator build needs --trace)
+  initial begin
+    if ($test$plusargs("vcd")) begin
+      $dumpfile("waves.vcd");
+      $dumpvars(0, tb_top);
+    end
   end
 
   // global watchdog

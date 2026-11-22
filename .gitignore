@@ -1,0 +1,10 @@
+# simulation outputs
+sim/obj_vl/
+sim/xsim.dir/
+sim/.Xil/
+sim/*.log
+sim/*.jou
+sim/*.pb
+sim/*.wdb
+sim/*.vcd
+sim/*.fst
