@@ -1,5 +1,6 @@
 ../rtl/nvme_pkg.sv
 ../rtl/nvme_identify.sv
+../rtl/ram_1r1w.sv
 ../rtl/dw_ram2.sv
 ../rtl/dw_fifo.sv
 ../rtl/tlp_rx.sv
@@ -9,6 +10,10 @@
 ../rtl/mwr_eng.sv
 ../rtl/ddr_rd.sv
 ../rtl/ddr_wr.sv
+../rtl/fletcher4.sv
+../rtl/deflate_enc.sv
+../rtl/inflate.sv
+../rtl/xform.sv
 ../rtl/nvme_ctrl.sv
 ../rtl/nvme_top.sv
 ../tb/axi_mem_model.sv

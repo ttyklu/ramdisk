@@ -8,14 +8,16 @@
 //  * NVMe host driver: Linux-like bring-up, Identify, queues, random Read/Write with
 //    PRP1 offsets, PRP2 and (chained) PRP lists, data checked against a disk model
 `timescale 1ns/1ps
-module tb_top;
+module tb_top #(
+  parameter int REC_LOG2 = 17          // largest compression record: 17 = 128 KB, 20 = 1 MB
+);
   import nvme_pkg::*;
 
   // ---------------- configuration ----------------
   localparam bit          BSWAP    = 1'b0;
   localparam int          NQ       = 4;
   localparam int          NV       = NQ + 1;
-  localparam logic [63:0] NSZE     = 64'd262144;
+  localparam logic [63:0] NSZE     = 64'd245760;   // 1 GB minus the 64 MB staging ring
   localparam bit [31:0]   BAR0     = 32'hF000_0000;
   localparam bit [63:0]   MSI_ADDR = 64'h0000_0000_FEE0_0000;
   localparam int          N_IO     = 80;
@@ -33,7 +35,7 @@ module tb_top;
   logic [63:0] wdata, rdata; logic [7:0] wstrb; logic [1:0] bresp, rresp;
   logic dma_err;
 
-  nvme_top #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .PAYLOAD_BSWAP(BSWAP)) dut (
+  nvme_top #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .REC_LOG2(REC_LOG2), .PAYLOAD_BSWAP(BSWAP)) dut (
     .clk, .rst,
     .rx_tdata, .rx_tkeep, .rx_tlast, .rx_tvalid, .rx_tready, .rx_tuser,
     .tx_tdata, .tx_tkeep, .tx_tlast, .tx_tvalid, .tx_tready, .tx_tuser,
@@ -351,7 +353,7 @@ module tb_top;
     while (d3[16] != cq_ph[q]) begin
       repeat (8) @(posedge clk);
       to += 8;
-      if (to > 400000) begin fail($sformatf("CQE timeout q=%0d cid=%0d", q, cid)); st = '1; return; end
+      if (to > 40_000_000) begin fail($sformatf("CQE timeout q=%0d cid=%0d", q, cid)); st = '1; return; end
       d3 = hr32(a + 12);
     end
     dw0 = hr32(a);
@@ -387,7 +389,7 @@ module tb_top;
     int n;
     n = (off1 + nbytes + 4095) / 4096;
     pages.delete();
-    for (int i = 0; i < n; i++) pages.push_back(region + 64'(((i * 37 + 5) % 64) * 4096));
+    for (int i = 0; i < n; i++) pages.push_back(region + 64'(((i * 37 + 5) % 1024) * 4096));
     prp1 = pages[0] + off1;
     prp2 = 64'd0;
     if (n == 2) prp2 = pages[1];
@@ -525,7 +527,7 @@ module tb_top;
     run_cmd(0, c, dw0, st);
     if (st != 0) fail("Identify controller status");
     if ({hr8(idbuf + 64'h801), hr8(idbuf + 64'h800)} != 16'h10EE) fail("Identify VID");
-    if (hr8(idbuf + 64'h800 + 77) != 8'd5)        fail("Identify MDTS");
+    if (hr8(idbuf + 64'h800 + 77) != 8'(REC_LOG2 - 11)) fail("Identify MDTS");
     if (hr32(idbuf + 64'h800 + 80) != 32'h0002_0400) fail("Identify VER");
     if (hr8(idbuf + 64'h800 + 512) != 8'h66)      fail("Identify SQES");
     if (hr8(idbuf + 64'h800 + 513) != 8'h44)      fail("Identify CQES");
@@ -604,7 +606,7 @@ module tb_top;
     run_cmd(2, c, dw0, st);
     if (st[10:0] != ST_INVALID_OPCODE) fail($sformatf("invalid opcode status %h", st));
 
-    c = new_cmd(8'h01, 32'd1);  c[6] = 32'h2000_0000; c[12] = 32'd40;   // 41 blocks > MDTS
+    c = new_cmd(8'h01, 32'd1);  c[6] = 32'h2000_0000; c[12] = 32'((2 << REC_LOG2) / 4096);   // MDTS + 1 blocks
     run_cmd(1, c, dw0, st);
     if (st[10:0] != ST_INVALID_FIELD) fail($sformatf("MDTS status %h", st));
 
@@ -638,6 +640,9 @@ module tb_top;
     do_write(1, NSZE - 2, 2, 0);
     do_read (2, NSZE - 2, 2, 8);
 
+    // ---- compression path ----
+    run_comp_tests();
+
     // ---- delete queues, disable ----
     for (int q = 2; q >= 1; q--) begin
       c = new_cmd(8'h00, 32'd0); c[10] = 32'(q);
@@ -661,6 +666,8 @@ module tb_top;
     $finish;
   end
 
+  `include "tb_comp.svh"
+
   // optional waveform dump: run with +vcd (Verilator build needs --trace)
   initial begin
     if ($test$plusargs("vcd")) begin
@@ -671,7 +678,7 @@ module tb_top;
 
   // global watchdog
   initial begin
-    #(200ms);
+    #(2s);
     $display("TEST FAILED (watchdog)");
     $finish;
   end

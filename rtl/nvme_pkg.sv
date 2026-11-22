@@ -47,5 +47,12 @@ package nvme_pkg;
   localparam logic [10:0] ST_AER_LIMIT        = {3'd1, 8'h05};
   localparam logic [10:0] ST_INVALID_IV       = {3'd1, 8'h08};
   localparam logic [10:0] ST_INVALID_QDEL     = {3'd1, 8'h0C};
+  localparam logic [10:0] ST_CMD_SEQ          = {3'd0, 8'h0C};   // compression disabled (RAW)
+  // compression path, command specific (docs/compression_spec.md)
+  localparam logic [10:0] ST_STAGING_FULL     = {3'd1, 8'hC0};
+  localparam logic [10:0] ST_BAD_HANDLE       = {3'd1, 8'hC1};
+  localparam logic [10:0] ST_CKSUM            = {3'd1, 8'hC2};
+  localparam logic [10:0] ST_DECOMP           = {3'd1, 8'hC3};
+  localparam logic [10:0] ST_LEN              = {3'd1, 8'hC4};
 
 endpackage

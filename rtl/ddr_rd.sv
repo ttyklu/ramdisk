@@ -10,7 +10,7 @@ module ddr_rd #(
   input  logic         job_valid,
   output logic         job_ready,
   input  logic [31:0]  job_addr,      // 128-byte aligned
-  input  logic [17:0]  job_len,       // bytes, multiple of 128
+  input  logic [23:0]  job_len,       // bytes, multiple of 128
 
   input  logic [FAW:0] fifo_free,
 
@@ -32,13 +32,13 @@ module ddr_rd #(
   output logic         busy
 );
 
-  logic [10:0] bursts_left;
+  logic [16:0] bursts_left;
   logic [31:0] addr;
   logic [FAW:0] inflight;      // beats requested but not yet received
 
   wire [FAW+1:0] need = ({1'b0, inflight} + (FAW+2)'(16)) << 1;   // DWs to reserve
 
-  assign arvalid = (bursts_left != 11'd0) && ({1'b0, fifo_free} >= need);
+  assign arvalid = (bursts_left != 17'd0) && ({1'b0, fifo_free} >= need);
   assign araddr  = addr;
   assign arlen   = 8'd15;
   assign arsize  = 3'd3;
@@ -49,7 +49,7 @@ module ddr_rd #(
   assign push_dw0 = rdata[31:0];
   assign push_dw1 = rdata[63:32];
 
-  assign busy      = (bursts_left != 11'd0) || (inflight != '0);
+  assign busy      = (bursts_left != 17'd0) || (inflight != '0);
   assign job_ready = !busy;
 
   wire ar_fire = arvalid && arready;
@@ -62,10 +62,10 @@ module ddr_rd #(
     end else begin
       if (job_valid && job_ready) begin
         addr        <= job_addr;
-        bursts_left <= job_len[17:7];
+        bursts_left <= job_len[23:7];
       end else if (ar_fire) begin
         addr        <= addr + 32'd128;
-        bursts_left <= bursts_left - 11'd1;
+        bursts_left <= bursts_left - 17'd1;
       end
       inflight <= inflight + (ar_fire ? (FAW+1)'(16) : '0) - (rvalid ? (FAW+1)'(1) : '0);
     end

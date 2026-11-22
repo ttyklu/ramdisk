@@ -3,7 +3,10 @@
 //  * Round-robin arbitration over the admin SQ and up to NQ I/O SQs
 //  * Admin commands handled in hardware: Identify (CNS 0/1/2, others return zeros),
 //    Get Log Page, Set/Get Features, Create/Delete I/O SQ/CQ, Abort, Async Event Request
-//  * NVM commands: Read, Write, Flush; 4 KB LBAs, MDTS = 128 KB
+//  * NVM commands: Read, Write, Flush; 4 KB LBAs, MDTS = 2 x largest record
+//  * Compression (docs/compression_spec.md): Set/Get Features C0h (RAW by default),
+//    Compress-to-Staging 81h, Commit 84h, Decompress-Read 86h, FFE-Send 89h, FFE-Receive 8Ah,
+//    staging slots in DDR after the namespace, work done by the xform engine
 //  * PRP1/PRP2 and PRP lists (including chained list pages)
 //  * Completion queue entries with phase tag; MSI-X interrupts with mask / pending bits
 module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
@@ -13,7 +16,10 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
   parameter logic [31:0] DDR_BASE  = 32'h0000_0000,
   parameter int          RAW       = 10,
   parameter int          FAW       = 10,
-  parameter int          MAX_BLKS  = 32            // MDTS in 4 KB blocks
+  parameter int          REC_LOG2  = 17,           // largest record: 17 = 128 KB ... 20 = 1 MB
+  parameter int          MAX_BLKS  = (2 << REC_LOG2) / 4096,   // MDTS in 4 KB blocks
+  parameter int          NSLOT     = 128,          // staging slots (power of 2)
+  parameter logic [31:0] RING_BASE = 32'h3C00_0000 // first staging slot
 )(
   input  logic                   clk,
   input  logic                   rst,
@@ -68,9 +74,31 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
   input  logic                   ddrw_job_ready,
   input  logic                   ddrw_busy,
   output logic [31:0]            ddr_job_addr,
-  output logic [17:0]            ddr_job_len,
+  output logic [23:0]            ddr_job_len,
   output logic                   data_to_ddr,     // ddr_wr owns the dma_rd pop port
-  output logic                   txf_flush        // empty the TX FIFO (controller disabled)
+  output logic                   txf_flush,       // empty the TX FIFO (controller disabled)
+
+  // xform engine
+  output logic                   xf_start,
+  output logic [1:0]             xf_func,
+  output logic [31:0]            xf_rd_addr,
+  output logic [23:0]            xf_rd_len,
+  output logic [4:0]             xf_skip,
+  output logic [23:0]            xf_in_len,
+  output logic [23:0]            xf_ck_len,
+  output logic                   xf_dst_tx,
+  output logic [31:0]            xf_wr_addr,
+  output logic [23:0]            xf_out_lim,
+  input  logic                   xf_busy,
+  input  logic                   xf_done,
+  input  logic [23:0]            xf_out_len,
+  input  logic [23:0]            xf_wr_bytes,
+  input  logic                   xf_over,
+  input  logic [255:0]           xf_fi,          // {d, c, b, a}
+  input  logic [255:0]           xf_fo,
+  input  logic [31:0]            xf_adler,
+  input  logic [3:0]             xf_ierr,
+  input  logic [23:0]            xf_consumed
 );
 
   localparam int Q  = NQ + 1;
@@ -82,11 +110,14 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
     S_PRP, S_PRPL_CALC, S_PRPL_FETCH, S_PRPL_RD,
     S_DATA_START, S_DATA_CHUNK, S_DATA_WAIT,
     S_CQE_ROOM, S_CQE_PUSH0, S_CQE_PUSH1, S_CQE_JOB, S_CQE_WAIT,
-    S_INT, S_INT_PUSH, S_INT_JOB, S_INT_WAIT
+    S_INT, S_INT_PUSH, S_INT_JOB, S_INT_WAIT,
+    S_POST, S_XF_WAIT, S_C2S_FIN, S_DEC_FIN, S_SLOT_WR, S_RES_GEN, S_RES_JOB, S_RES_WAIT,
+    S_SLOT_RD, S_COMMIT_CHK, S_RECV_CHK, S_FREE_CQE,
+    S_MD_FETCH, S_MD_RD, S_DREAD_GO, S_DESC_FETCH, S_DESC_RD, S_DESC_PARSE, S_FFE_CHK, S_FFE_DEST
   } st_t;
   st_t st;
 
-  typedef enum logic [1:0] {SRC_DDR, SRC_ID, SRC_LOG} src_t;
+  typedef enum logic [2:0] {SRC_DDR, SRC_ID, SRC_LOG, SRC_CRB, SRC_XF} src_t;
 
   // ---------------- queue state ----------------
   logic [63:0] sq_base [Q];
@@ -126,15 +157,16 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
   src_t        src;
   logic [7:0]  id_cns;
   logic [7:0]  log_id;
-  logic [17:0] xfer;             // bytes
-  logic [17:0] remaining;
+  logic [23:0] xfer;             // bytes
+  logic [23:0] remaining;
+  logic [23:0] pxfer;            // buffer length the PRPs describe, if larger than xfer (0 = xfer)
   logic [31:0] ddr_addr;
   logic [63:0] prp [NP];
-  logic [5:0]  prp_wi;           // next PRP slot to fill
-  logic [5:0]  pi;               // current PRP slot in data phase
+  logic [9:0]  prp_wi;           // next PRP slot to fill
+  logic [9:0]  pi;               // current PRP slot in data phase
   logic [63:0] cur_addr;
   logic [63:0] list_addr;
-  logic [5:0]  need;             // list entries still to read
+  logic [9:0]  need;             // list entries still to read
   logic [9:0]  ent_cnt, ent_i;
   logic        chain;
 
@@ -145,6 +177,75 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
 
   // interrupt
   logic [2:0]  int_v;
+
+  // ---------------- compression ----------------
+  localparam int          SLOT_LOG2 = REC_LOG2 + 2;               // slot = 4 x record
+  localparam int          SW        = (NSLOT > 1) ? $clog2(NSLOT) : 1;
+  localparam logic [3:0]  MAXRS     = 4'(REC_LOG2 - 17);
+  localparam logic [7:0]  MDTS_V    = 8'($clog2(MAX_BLKS));
+  localparam logic [23:0] MAX_REC   = 24'(1) << REC_LOG2;
+
+  typedef enum logic [2:0] {K_NONE, K_C2S, K_COMMIT, K_DREAD, K_FSEND, K_FRECV} kind_t;
+
+  logic             cen;                     // compression commands enabled (RAW when 0)
+  logic [3:0]       recsz;                   // record size limit = 128 KB << recsz
+  wire  [23:0]      rec_lim = 24'h02_0000 << recsz;
+  logic [NSLOT-1:0] slot_busy, slot_ffe;
+  logic [15:0]      slot_lid [NSLOT];
+  logic [511:0]     slot_mem [NSLOT];        // CRB per slot (block RAM)
+  logic [511:0]     srec;
+  logic [SW-1:0]    cur_slot;
+  logic [31:0]      crb [16];
+  kind_t            kind;
+  logic [23:0]      k_len;                   // record / payload bytes
+  logic [7:0]       k_thr;                   // threshold percent (0 = ZFS 12.5% rule)
+  logic [63:0]      k_slba;
+  logic [23:0]      k_psz, k_csize, k_ulen;
+  logic             k_nochk, k_discard;
+  logic [31:0]      dsc [128];               // FFE descriptors / MPTR descriptor
+  logic [7:0]       dsc_n, dsc_i;
+  logic [7:0]       dwi;
+  logic [7:0]       f_fn;                    // 82h / 83h
+  logic             f_has_fd, f_has_fpd, f_dlba, f_bad;
+  logic [63:0]      f_dslba;
+  logic [15:0]      f_dnlb;
+  logic [7:0]       f_srci;
+  logic [31:0]      f_fpd1, f_fpd2, f_fpd3;
+  logic [23:0]      roff;                    // retained input offset in the raw area
+  logic             xf_pend;
+  st_t              xf_next;
+  logic             f_lbasrc, f_cmt;
+  logic [15:0]      k_nlb;
+
+  wire [63:0] mptr = {cmd[5], cmd[4]};
+  wire [31:0] cdw13 = cmd[13];
+  wire [31:0] cdw14 = cmd[14];
+  wire [31:0] cdw15 = cmd[15];
+
+  function automatic logic [31:0] slot_raw(input logic [SW-1:0] sl);
+    return RING_BASE + (32'(sl) << SLOT_LOG2);
+  endfunction
+  function automatic logic [31:0] slot_out(input logic [SW-1:0] sl);
+    return slot_raw(sl) + (32'd1 << (SLOT_LOG2 - 1));
+  endfunction
+  function automatic logic [23:0] up4k(input logic [23:0] v);
+    return (v + 24'hFFF) & 24'hFF_F000;
+  endfunction
+  function automatic logic [23:0] up128(input logic [23:0] v);
+    return (v + 24'h7F) & 24'hFF_FF80;
+  endfunction
+
+  // first free slot, and the busy FFE slot holding this command's List ID
+  logic          have_free, have_lid;
+  logic [SW-1:0] free_idx, lid_idx;
+  always_comb begin
+    have_free = 1'b0; free_idx = '0;
+    have_lid  = 1'b0; lid_idx  = '0;
+    for (int k = NSLOT - 1; k >= 0; k--) begin
+      if (!slot_busy[k]) begin have_free = 1'b1; free_idx = SW'(k); end
+      if (slot_busy[k] && slot_ffe[k] && slot_lid[k] == cmd[2][15:0]) begin have_lid = 1'b1; lid_idx = SW'(k); end
+    end
+  end
 
   // ---------------- helpers ----------------
   function automatic logic [15:0] qwrap(input logic [15:0] v, input logic [15:0] sz);
@@ -158,10 +259,15 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
     if (s == SRC_ID) begin
       case (cns)
         8'h00: r = id_ns_dw(i[9:0], NSZE);
-        8'h01: r = id_ctrl_dw(i[9:0]);
+        8'h01: begin
+          r = id_ctrl_dw(i[9:0]);
+          if (i == 11'd19) r[15:8] = MDTS_V;          // byte 77: MDTS from the build
+        end
         8'h02: r = (i == 11'd0) ? 32'd1 : 32'd0;     // active NS list: NSID 1
         default: r = 32'd0;
       endcase
+    end else if (s == SRC_CRB) begin
+      if (i < 11'd14) r = crb[i[3:0]];               // DW 14-15 are internal
     end else if (s == SRC_LOG) begin
       if (lid == 8'h02) begin                         // SMART / health
         if (i == 11'd0) r = 32'h6401_2C00;            // temp 300 K, spare 100%
@@ -204,11 +310,12 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
 
   // ---------------- data-phase chunk ----------------
   wire [12:0] page_room = 13'd4096 - {1'b0, cur_addr[11:0]};
-  wire [12:0] chunk     = ({1'b0, remaining} < {5'd0, page_room}) ? remaining[12:0] : page_room;
+  wire [12:0] chunk     = (remaining < 24'(page_room)) ? remaining[12:0] : page_room;
 
   // ---------------- PRP setup values ----------------
   wire [12:0] first_len = 13'd4096 - {1'b0, prp1[11:0]};
-  wire [17:0] rem2      = xfer - {5'd0, first_len};
+  wire [23:0] plen      = (pxfer > xfer) ? pxfer : xfer;  // PRP layout follows the buffer length
+  wire [23:0] rem2      = plen - 24'(first_len);
   wire [9:0]  list_room = 10'((13'd4096 - {1'b0, list_addr[11:0]}) >> 3);
 
   // ---------------- CQE ----------------
@@ -291,6 +398,24 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         mwr_job_addr  = msix_addr[int_v*64 +: 64];
         mwr_job_len   = 12'd1;
       end
+      S_MD_FETCH: begin
+        drd_job_valid = 1'b1;
+        drd_job_addr  = {mptr[63:2], 2'b00};
+        drd_job_len   = 12'd16;
+      end
+      S_DESC_FETCH: begin
+        drd_job_valid = 1'b1;
+        drd_job_addr  = {prp1[63:2], 2'b00};
+        drd_job_len   = 12'({dsc_n, 4'd0});
+      end
+      S_MD_RD, S_DESC_RD: begin
+        if (drd_avail >= 2) drd_pop = 2'd2;
+      end
+      S_RES_JOB: begin
+        mwr_job_valid = 1'b1;
+        mwr_job_addr  = {mptr[63:2], 2'b00};
+        mwr_job_len   = 12'd16;
+      end
       default: ;
     endcase
 
@@ -310,6 +435,51 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
   assign data_to_ddr = !to_host && (st == S_DATA_START || st == S_DATA_CHUNK || st == S_DATA_WAIT);
   assign txf_flush   = (st == S_OFF);
 
+  // ---------------- xform job setup ----------------
+  task automatic set_xf(input logic [1:0] fn, input logic [31:0] ra, input logic [23:0] rl,
+                        input logic [4:0] sk, input logic [23:0] il, input logic [23:0] cl,
+                        input logic tx, input logic [31:0] wa, input logic [23:0] lim);
+    xf_func    <= fn;
+    xf_rd_addr <= ra;
+    xf_rd_len  <= rl;
+    xf_skip    <= sk;
+    xf_in_len  <= il;
+    xf_ck_len  <= cl;
+    xf_dst_tx  <= tx;
+    xf_wr_addr <= wa;
+    xf_out_lim <= lim;
+  endtask
+
+  task automatic start_xf(input logic [1:0] fn, input logic [31:0] ra, input logic [23:0] rl,
+                          input logic [4:0] sk, input logic [23:0] il, input logic [23:0] cl,
+                          input logic tx, input logic [31:0] wa, input logic [23:0] lim, input st_t nxt);
+    set_xf(fn, ra, rl, sk, il, cl, tx, wa, lim);
+    xf_start <= 1'b1;
+    xf_next  <= nxt;
+    st       <= S_XF_WAIT;
+  endtask
+
+  // copy the stored bytes of the current slot (fields of a CRB): il bytes to wa / the TX FIFO
+  task automatic copy_slot(input logic [511:0] rec, input logic [23:0] il, input logic tx,
+                           input logic [31:0] wa, input logic [23:0] lim, input st_t nxt, input logic go);
+    logic        inc, dec;
+    logic [23:0] ro, n;
+    logic [4:0]  sk;
+    inc = rec[16];
+    dec = rec[18];
+    ro  = rec[14*32 +: 24];
+    if (inc && !dec) begin
+      // incompressible: raw data at roff in the raw area, only lsize bytes are real
+      n  = (il > rec[32 +: 24]) ? rec[32 +: 24] : il;
+      sk = 5'(ro[6:2]);
+      if (go) start_xf(2'd0, slot_raw(cur_slot) + {8'd0, ro[23:7], 7'd0}, up128(24'({sk, 2'b00}) + n), sk, n, 24'd0, tx, wa, lim, nxt);
+      else    set_xf  (2'd0, slot_raw(cur_slot) + {8'd0, ro[23:7], 7'd0}, up128(24'({sk, 2'b00}) + n), sk, n, 24'd0, tx, wa, lim);
+    end else begin
+      if (go) start_xf(2'd0, slot_out(cur_slot), up128(il), 5'd0, il, 24'd0, tx, wa, lim, nxt);
+      else    set_xf  (2'd0, slot_out(cur_slot), up128(il), 5'd0, il, 24'd0, tx, wa, lim);
+    end
+  endtask
+
   // ---------------- main FSM ----------------
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -325,8 +495,22 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
       gen_active <= 1'b0;
       db_clr     <= 1'b0;
       to_host    <= 1'b0;
+      slot_busy  <= '0;
+      slot_ffe   <= '0;
+      cen        <= 1'b0;
+      recsz      <= '0;
+      xf_start   <= 1'b0;
+      xf_pend    <= 1'b0;
+      kind       <= K_NONE;
     end else begin
-      db_clr <= 1'b0;
+      db_clr   <= 1'b0;
+      xf_start <= 1'b0;
+
+      // FFE-Receive: retained data follows the CRB once the generator is done
+      if (xf_pend && !gen_active && (st == S_DATA_CHUNK || st == S_DATA_WAIT)) begin
+        xf_start <= 1'b1;
+        xf_pend  <= 1'b0;
+      end
 
       // generator progress
       if (gen_active && txf_free >= 2) begin
@@ -361,9 +545,12 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         end
 
         S_DISABLE: begin
-          if (drd_idle && mwr_idle && !ddrr_busy && !ddrw_busy && !gen_active && drd_avail == '0) begin
-            sq_valid <= '0;
-            cq_valid <= '0;
+          if (drd_idle && mwr_idle && !ddrr_busy && !ddrw_busy && !gen_active && drd_avail == '0 && !xf_busy) begin
+            sq_valid  <= '0;
+            cq_valid  <= '0;
+            slot_busy <= '0;                       // a controller reset frees every staging slot
+            cen       <= 1'b0;                     // and returns to RAW
+            recsz     <= '0;
             csts_rdy <= 1'b0;
             st       <= S_OFF;
           end
@@ -405,6 +592,8 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         S_DECODE: begin
           res_dw0 <= 32'd0;
           status  <= ST_SUCCESS;
+          kind    <= K_NONE;
+          pxfer   <= '0;
           st      <= S_CQE_ROOM;          // default: no data phase
 
           if (cur_q == 3'd0) begin
@@ -414,7 +603,7 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
                 id_cns  <= cdw10[7:0];
                 src     <= SRC_ID;
                 to_host <= 1'b1;
-                xfer    <= 18'd4096;
+                xfer    <= 24'd4096;
                 st      <= S_PRP;
               end
               8'h02: begin  // Get Log Page
@@ -423,11 +612,22 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
                 log_id  <= cdw10[7:0];
                 src     <= SRC_LOG;
                 to_host <= 1'b1;
-                xfer    <= (numd > 32'd1024) ? 18'd4096 : 18'({numd[10:0], 2'b00});
+                xfer    <= (numd > 32'd1024) ? 24'd4096 : 24'({numd[10:0], 2'b00});
                 st      <= S_PRP;
               end
               8'h09, 8'h0A: begin  // Set / Get Features
                 if (cdw10[7:0] == 8'h07) res_dw0 <= {16'(NQ - 1), 16'(NQ - 1)};
+                if (cdw10[7:0] == 8'hC0) begin             // compression configuration
+                  if (opc == 8'h09) begin
+                    if (cdw11[7:4] > MAXRS) status <= ST_INVALID_FIELD;
+                    else begin
+                      cen   <= cdw11[0];
+                      recsz <= cdw11[7:4];
+                    end
+                  end else begin
+                    res_dw0 <= {16'(NSLOT), MAXRS, 4'd0, recsz, 3'd0, cen};
+                  end
+                end
               end
               8'h05: begin  // Create I/O CQ
                 logic [15:0] qid, qs, iv;
@@ -527,9 +727,97 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
                 else begin
                   to_host  <= (opc == 8'h02);
                   src      <= SRC_DDR;
-                  xfer     <= {nblk[5:0], 12'd0};
+                  xfer     <= 24'({nblk[11:0], 12'd0});
                   ddr_addr <= DDR_BASE + {slba[19:0], 12'd0};
                   st       <= S_PRP;
+                end
+              end
+              8'h81: begin  // Compress-to-Staging (phase 1)
+                if (!cen) status <= ST_CMD_SEQ;
+                else if (nsid != 32'd1) status <= ST_INVALID_NS;
+                else if (cdw10 == 32'd0 || cdw10[8:0] != 9'd0 || cdw10 > 32'(rec_lim) ||
+                         prp1[1:0] != 2'b00 || mptr[1:0] != 2'b00)
+                  status <= ST_INVALID_FIELD;
+                else if (!have_free) status <= ST_STAGING_FULL;
+                else begin
+                  cur_slot            <= free_idx;
+                  slot_busy[free_idx] <= 1'b1;
+                  slot_ffe[free_idx]  <= 1'b0;
+                  kind     <= K_C2S;
+                  k_len    <= cdw10[23:0];
+                  k_thr    <= cdw11[7:0];
+                  roff     <= '0;
+                  to_host  <= 1'b0;
+                  src      <= SRC_DDR;
+                  xfer     <= cdw10[23:0];
+                  ddr_addr <= slot_raw(free_idx);
+                  st       <= S_PRP;
+                end
+              end
+              8'h84: begin  // Commit (phase 2)
+                if (!cen) status <= ST_CMD_SEQ;
+                else if (nsid != 32'd1) status <= ST_INVALID_NS;
+                else if (cdw13[15:0] >= 16'(NSLOT) || !slot_busy[cdw13[SW-1:0]]) status <= ST_BAD_HANDLE;
+                else begin
+                  cur_slot  <= cdw13[SW-1:0];
+                  kind      <= K_COMMIT;
+                  k_slba    <= {cdw11, cdw10};
+                  k_nlb     <= cdw12[15:0];
+                  k_discard <= cdw13[31];
+                  st        <= S_SLOT_RD;
+                end
+              end
+              8'h86: begin  // Decompress-Read
+                logic [31:0] ext;
+                ext = ({16'd0, cdw12[15:0]} + 32'd1) << 12;
+                if (nsid != 32'd1) status <= ST_INVALID_NS;
+                else if ({cdw11, cdw10} >= NSZE || (NSZE - {cdw11, cdw10}) < (64'(cdw12[15:0]) + 64'd1))
+                  status <= ST_LBA_RANGE;
+                else if (ext > 32'(MAX_REC) * 2 || cdw13 == 32'd0 || cdw13 > ext ||
+                         cdw14 == 32'd0 || cdw14[1:0] != 2'b00 || cdw14 > 32'(MAX_REC) ||
+                         prp1[1:0] != 2'b00 || (!cdw15[0] && mptr[1:0] != 2'b00))
+                  status <= ST_INVALID_FIELD;
+                else begin
+                  kind    <= K_DREAD;
+                  k_slba  <= {cdw11, cdw10};
+                  k_psz   <= ext[23:0];
+                  k_csize <= cdw13[23:0];
+                  k_ulen  <= cdw14[23:0];
+                  k_nochk <= cdw15[0];
+                  st      <= cdw15[0] ? S_DREAD_GO : S_MD_FETCH;
+                end
+              end
+              8'h89: begin  // FFE-Send
+                logic [8:0] n;
+                n = 9'(cdw11[15:0]) + 9'(cdw11[31:16]);
+                if (!cen) status <= ST_CMD_SEQ;
+                else if (nsid != 32'd1) status <= ST_INVALID_NS;
+                else if (cdw11[15:8] != 8'd0 || cdw11[31:24] != 8'd0 || n == 9'd0 || n > 9'd8 ||
+                         cdw10 < 32'({n, 6'd0}) || cdw10[6:0] != 7'd0 || cdw10 > 32'(MAX_BLKS) * 32'd4096 ||
+                         prp1[1:0] != 2'b00 || (13'(prp1[11:0]) + 13'({n, 6'd0})) > 13'd4096)
+                  status <= ST_INVALID_FIELD;
+                else if (have_lid) status <= ST_INVALID_FIELD;            // List ID already in use
+                else if (!have_free) status <= ST_STAGING_FULL;
+                else begin
+                  cur_slot            <= free_idx;
+                  slot_busy[free_idx] <= 1'b1;
+                  slot_ffe[free_idx]  <= 1'b1;
+                  slot_lid[free_idx]  <= cmd[2][15:0];
+                  kind  <= K_FSEND;
+                  dsc_n <= n[7:0];
+                  st    <= S_DESC_FETCH;
+                end
+              end
+              8'h8A: begin  // FFE-Receive
+                if (nsid != 32'd1) status <= ST_INVALID_NS;
+                else if (!have_lid) status <= ST_BAD_HANDLE;
+                else if (cdw10 == 32'd0 || cdw10[1:0] != 2'b00 || cdw10 > 32'(MAX_BLKS) * 32'd4096 ||
+                         prp1[1:0] != 2'b00)
+                  status <= ST_INVALID_FIELD;
+                else begin
+                  cur_slot <= lid_idx;
+                  kind     <= K_FRECV;
+                  st       <= S_SLOT_RD;
                 end
               end
               default: status <= ST_INVALID_OPCODE;
@@ -540,15 +828,15 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         // ---------------------------------------------------------------
         S_PRP: begin
           prp[0] <= {prp1[63:2], 2'b00};
-          if ({1'b0, xfer} <= {6'd0, first_len}) begin
+          if (plen <= 24'(first_len)) begin
             st <= S_DATA_START;
-          end else if (rem2 <= 18'd4096) begin
+          end else if (rem2 <= 24'd4096) begin
             prp[1] <= {prp2[63:12], 12'd0};
             st     <= S_DATA_START;
           end else begin
-            need      <= 6'((rem2 + 18'd4095) >> 12);
+            need      <= 10'((rem2 + 24'd4095) >> 12);
             list_addr <= {prp2[63:3], 3'b000};
-            prp_wi    <= 6'd1;
+            prp_wi    <= 10'd1;
             st        <= S_PRPL_CALC;
           end
         end
@@ -556,11 +844,11 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         S_PRPL_CALC: begin
           // entries to read from the current list page; if more are needed than fit,
           // the last entry of the page is a pointer to the next list page
-          if ({4'd0, need} > list_room) begin
+          if (need > list_room) begin
             ent_cnt <= list_room;
             chain   <= 1'b1;
           end else begin
-            ent_cnt <= {4'd0, need};
+            ent_cnt <= need;
             chain   <= 1'b0;
           end
           st <= S_PRPL_FETCH;
@@ -579,8 +867,8 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
               list_addr <= {drd_head1, drd_head0[31:3], 3'b000};
             end else begin
               prp[prp_wi] <= {drd_head1, drd_head0[31:12], 12'd0};
-              prp_wi      <= prp_wi + 6'd1;
-              need        <= need - 6'd1;
+              prp_wi      <= prp_wi + 10'd1;
+              need        <= need - 10'd1;
             end
             ent_i <= ent_i + 10'd1;
             if (ent_i == ent_cnt - 10'd1)
@@ -592,11 +880,20 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         S_DATA_START: begin
           remaining <= xfer;
           cur_addr  <= prp[0];
-          pi        <= 6'd0;
+          pi        <= 10'd0;
           if (to_host && src == SRC_DDR) begin
             if (ddrr_job_ready) st <= S_DATA_CHUNK;
           end else if (!to_host) begin
             if (ddrw_job_ready) st <= S_DATA_CHUNK;
+          end else if (src == SRC_XF) begin
+            xf_start <= 1'b1;                       // Decompress-Read: inflate straight to the TX FIFO
+            st       <= S_DATA_CHUNK;
+          end else if (src == SRC_CRB) begin
+            gen_active <= 1'b1;                     // FFE-Receive: CRB first, then retained data
+            gen_idx    <= '0;
+            gen_total  <= (xfer >= 24'd64) ? 11'd16 : 11'(xfer >> 2);
+            xf_pend    <= (xfer > 24'd64);
+            st         <= S_DATA_CHUNK;
           end else begin
             gen_active <= 1'b1;
             gen_idx    <= '0;
@@ -607,18 +904,18 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
 
         S_DATA_CHUNK: begin
           if ((to_host && mwr_job_ready) || (!to_host && drd_job_ready)) begin
-            remaining <= remaining - {5'd0, chunk};
-            pi        <= pi + 6'd1;
-            cur_addr  <= prp[pi + 6'd1];
-            if (remaining == {5'd0, chunk}) st <= S_DATA_WAIT;
+            remaining <= remaining - 24'(chunk);
+            pi        <= pi + 10'd1;
+            cur_addr  <= prp[pi + 10'd1];
+            if (remaining == 24'(chunk)) st <= S_DATA_WAIT;
           end
         end
 
         S_DATA_WAIT: begin
           if (to_host) begin
-            if (mwr_idle && !ddrr_busy && !gen_active) st <= S_CQE_ROOM;
+            if (mwr_idle && !ddrr_busy && !gen_active && !xf_busy && !xf_pend && !xf_start) st <= S_POST;
           end else begin
-            if (drd_idle && !ddrw_busy && drd_avail == '0) st <= S_CQE_ROOM;
+            if (drd_idle && !ddrw_busy && drd_avail == '0) st <= S_POST;
           end
         end
 
@@ -652,6 +949,297 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         S_INT_PUSH: if (txf_free >= 1) st <= S_INT_JOB;
         S_INT_JOB:  if (mwr_job_ready) st <= S_INT_WAIT;
         S_INT_WAIT: if (mwr_idle) st <= S_IDLE;
+
+        // ===============================================================
+        // compression path
+        // ===============================================================
+        S_POST: begin
+          case (kind)
+            K_C2S:
+              start_xf(2'd1, slot_raw(cur_slot), up128(k_len), 5'd0, k_len, k_len, 1'b0,
+                       slot_out(cur_slot), MAX_REC << 1, S_C2S_FIN);
+            K_FSEND: begin
+              logic [4:0] sk;
+              sk = 5'(roff[6:2]);
+              if (f_fn == 8'h82)
+                start_xf(2'd1, slot_raw(cur_slot) + {8'd0, roff[23:7], 7'd0}, up128(24'({sk, 2'b00}) + k_len),
+                         sk, k_len, k_len, 1'b0, slot_out(cur_slot), MAX_REC << 1, S_C2S_FIN);
+              else if (f_lbasrc)
+                start_xf(2'd2, DDR_BASE + {k_slba[19:0], 12'd0}, k_psz, 5'd0, k_psz, k_psz, 1'b0,
+                         slot_out(cur_slot), MAX_REC, S_DEC_FIN);
+              else
+                start_xf(2'd2, slot_raw(cur_slot) + {8'd0, roff[23:7], 7'd0}, up128(24'({sk, 2'b00}) + k_len),
+                         sk, k_len, (k_len + 24'd3) & ~24'd3, 1'b0, slot_out(cur_slot), MAX_REC, S_DEC_FIN);
+            end
+            K_DREAD: begin
+              if (!k_nochk && xf_fi != {dsc[11], dsc[10], dsc[9], dsc[8], dsc[7], dsc[6], dsc[5], dsc[4]})
+                status <= ST_CKSUM;
+              else if (xf_ierr != 4'd0)
+                status <= ST_DECOMP;
+              else if (xf_out_len != k_ulen || xf_over)
+                status <= ST_LEN;
+              st <= S_CQE_ROOM;
+            end
+            K_FRECV: st <= S_FREE_CQE;
+            default: st <= S_CQE_ROOM;
+          endcase
+        end
+
+        S_XF_WAIT: if (xf_done) st <= xf_next;
+
+        // compressed: decide incompressible, build the CRB
+        S_C2S_FIN: begin
+          logic        inc;
+          logic [23:0] cs, ps;
+          logic [255:0] fl;
+          cs = xf_out_len;
+          if (k_thr == 8'd0) inc = xf_over || (cs > k_len - (k_len >> 3));
+          else               inc = xf_over || (48'(cs) * 48'd100 > 48'(k_len) * 48'(k_thr));
+          ps = inc ? up4k(k_len) : xf_wr_bytes;
+          fl = inc ? xf_fi : xf_fo;
+          crb[0]  <= {13'd0, 1'b0, 1'b1, inc, 16'(cur_slot)};   // flags: INCOMP, VALID, DECOMP
+          crb[1]  <= 32'(k_len);
+          crb[2]  <= inc ? 32'(k_len) : 32'(cs);
+          crb[3]  <= 32'(ps);
+          for (int k = 0; k < 8; k++) crb[4 + k] <= fl[32*k +: 32];
+          crb[12] <= xf_adler;
+          crb[13] <= {16'd0, slot_ffe[cur_slot] ? slot_lid[cur_slot] : 16'd0};
+          crb[14] <= 32'(roff);
+          crb[15] <= {31'd0, slot_ffe[cur_slot]};            // internal: FFE, COMMITTED, DECOMP
+          res_dw0 <= {15'd0, inc, 16'(cur_slot)};
+          f_cmt   <= 1'b0;
+          xf_next <= (kind == K_C2S) ? S_RES_GEN : S_FFE_DEST;
+          st      <= S_SLOT_WR;
+        end
+
+        // decompressed (FFE 83h): build the CRB
+        S_DEC_FIN: begin
+          logic [10:0] stt;
+          stt = (xf_ierr != 4'd0) ? ST_DECOMP : xf_over ? ST_LEN : ST_SUCCESS;
+          if (stt != ST_SUCCESS) begin
+            status              <= stt;
+            slot_busy[cur_slot] <= 1'b0;
+            st                  <= S_CQE_ROOM;
+          end else begin
+            crb[0]  <= {13'd0, 1'b1, 1'b1, 1'b0, 16'(cur_slot)};
+            crb[1]  <= 32'(xf_out_len);
+            crb[2]  <= 32'(xf_consumed);
+            crb[3]  <= 32'(xf_wr_bytes);
+            for (int k = 0; k < 8; k++) crb[4 + k] <= xf_fi[32*k +: 32];
+            crb[12] <= 32'd0;
+            crb[13] <= {16'd0, slot_lid[cur_slot]};
+            crb[14] <= 32'd0;
+            crb[15] <= {29'd0, 1'b1, 1'b0, 1'b1};
+            res_dw0 <= {16'd0, 16'(cur_slot)};
+            f_cmt   <= 1'b0;
+            xf_next <= S_FFE_DEST;
+            st      <= S_SLOT_WR;
+          end
+        end
+
+        S_SLOT_WR: begin
+          logic [511:0] w;
+          for (int k = 0; k < 16; k++) w[32*k +: 32] = crb[k];
+          slot_mem[cur_slot] <= w;
+          st <= xf_next;
+        end
+
+        // Compress-to-Staging result record to MPTR
+        S_RES_GEN: begin
+          src        <= SRC_CRB;
+          gen_active <= 1'b1;
+          gen_idx    <= '0;
+          gen_total  <= 11'd16;
+          st         <= S_RES_JOB;
+        end
+        S_RES_JOB:  if (mwr_job_ready) st <= S_RES_WAIT;
+        S_RES_WAIT: if (mwr_idle && !gen_active) st <= S_CQE_ROOM;
+
+        // FFE-Send: optional LBA destination, then done
+        S_FFE_DEST: begin
+          logic [511:0] w;
+          for (int k = 0; k < 16; k++) w[32*k +: 32] = crb[k];
+          if (f_dlba) begin
+            f_dlba <= 1'b0;
+            if (f_dslba >= NSZE || (NSZE - f_dslba) < (64'(f_dnlb) + 64'd1)) begin
+              status <= ST_LBA_RANGE;
+              slot_busy[cur_slot] <= 1'b0;
+              st <= S_CQE_ROOM;
+            end else if (crb[3] > ((32'(f_dnlb) + 32'd1) << 12)) begin
+              status <= ST_LEN;
+              slot_busy[cur_slot] <= 1'b0;
+              st <= S_CQE_ROOM;
+            end else begin
+              f_cmt <= 1'b1;
+              copy_slot(w, crb[3][23:0], 1'b0, DDR_BASE + {f_dslba[19:0], 12'd0}, crb[3][23:0], S_FFE_DEST, 1'b1);
+            end
+          end else if (f_cmt) begin
+            f_cmt      <= 1'b0;
+            crb[15][1] <= 1'b1;                               // committed: Receive returns the CRB only
+            xf_next    <= S_CQE_ROOM;
+            st         <= S_SLOT_WR;
+          end else begin
+            st <= S_CQE_ROOM;
+          end
+        end
+
+        S_SLOT_RD: begin
+          srec <= slot_mem[cur_slot];
+          st   <= (kind == K_COMMIT) ? S_COMMIT_CHK : S_RECV_CHK;
+        end
+
+        S_COMMIT_CHK: begin
+          if (k_discard) st <= S_FREE_CQE;
+          else if (((32'(k_nlb) + 32'd1) << 12) != srec[96 +: 32]) begin
+            status <= ST_INVALID_FIELD;
+            st     <= S_CQE_ROOM;
+          end else if (k_slba >= NSZE || (NSZE - k_slba) < (64'(k_nlb) + 64'd1)) begin
+            status <= ST_LBA_RANGE;
+            st     <= S_CQE_ROOM;
+          end else begin
+            copy_slot(srec, srec[96 +: 24], 1'b0, DDR_BASE + {k_slba[19:0], 12'd0}, srec[96 +: 24], S_FREE_CQE, 1'b1);
+          end
+        end
+
+        S_FREE_CQE: begin
+          slot_busy[cur_slot] <= 1'b0;
+          st <= S_CQE_ROOM;
+        end
+
+        S_RECV_CHK: begin
+          logic [23:0] ol, tot, dl;
+          for (int k = 0; k < 16; k++) crb[k] <= srec[32*k +: 32];
+          if (srec[15*32 + 1])  ol = 24'd0;                                // committed
+          else if (srec[18])    ol = (srec[32 +: 24] + 24'd3) & ~24'd3;     // decompressed bytes
+          else                  ol = srec[96 +: 24];                        // stored bytes
+          tot = (cdw10[23:0] < 24'd64 + ol) ? cdw10[23:0] : 24'd64 + ol;
+          dl  = (tot > 24'd64) ? tot - 24'd64 : 24'd0;
+          copy_slot(srec, dl, 1'b1, 32'd0, dl, S_IDLE, 1'b0);
+          res_dw0 <= 32'(tot);
+          xfer    <= tot;
+          pxfer   <= cdw10[23:0];                                        // PRPs describe the whole buffer
+          to_host <= 1'b1;
+          src     <= SRC_CRB;
+          st      <= S_PRP;
+        end
+
+        // Decompress-Read: MPTR descriptor (expected Fletcher-4), then the data phase
+        S_MD_FETCH: if (drd_job_ready) begin
+          dwi <= '0;
+          st  <= S_MD_RD;
+        end
+        S_MD_RD: if (drd_avail >= 2) begin
+          dsc[dwi[6:0]]         <= drd_head0;
+          dsc[dwi[6:0] + 7'd1]  <= drd_head1;
+          dwi <= dwi + 8'd2;
+          if (dwi == 8'd14) st <= S_DREAD_GO;
+        end
+        S_DREAD_GO: begin
+          set_xf(2'd2, DDR_BASE + {k_slba[19:0], 12'd0}, k_psz, 5'd0, k_csize, k_psz, 1'b1, 32'd0, k_ulen);
+          xfer    <= k_ulen;
+          to_host <= 1'b1;
+          src     <= SRC_XF;
+          st      <= S_PRP;
+        end
+
+        // FFE-Send: descriptors from the first page of PRP1
+        S_DESC_FETCH: if (drd_job_ready) begin
+          dwi <= '0;
+          st  <= S_DESC_RD;
+        end
+        S_DESC_RD: if (drd_avail >= 2) begin
+          dsc[dwi[6:0]]        <= drd_head0;
+          dsc[dwi[6:0] + 7'd1] <= drd_head1;
+          dwi <= dwi + 8'd2;
+          if (dwi + 8'd2 == {dsc_n[3:0], 4'd0}) begin
+            dsc_i     <= '0;
+            f_has_fd  <= 1'b0;
+            f_has_fpd <= 1'b0;
+            f_dlba    <= 1'b0;
+            f_bad     <= 1'b0;
+            st        <= S_DESC_PARSE;
+          end
+        end
+        S_DESC_PARSE: begin
+          logic [6:0] b;
+          logic [7:0] t;
+          b = {dsc_i[2:0], 4'd0};
+          t = dsc[b][7:0];
+          case (t)
+            8'h01: begin
+              f_dlba  <= dsc[b][8];
+              f_dslba <= {dsc[b + 7'd4], dsc[b + 7'd3]};
+              f_dnlb  <= dsc[b + 7'd5][15:0];
+            end
+            8'h03, 8'h04: ;
+            8'h82, 8'h83: begin
+              if (f_has_fd || dsc[b + 7'd1][31:16] != 16'd1) f_bad <= 1'b1;
+              f_has_fd <= 1'b1;
+              f_fn     <= t;
+              f_srci   <= dsc[b + 7'd4][7:0];
+            end
+            8'hFE: begin
+              f_has_fpd <= 1'b1;
+              f_fpd1    <= dsc[b + 7'd1];
+              f_fpd2    <= dsc[b + 7'd2];
+              f_fpd3    <= dsc[b + 7'd3];
+            end
+            default: f_bad <= 1'b1;
+          endcase
+          dsc_i <= dsc_i + 8'd1;
+          if (dsc_i + 8'd1 == dsc_n) st <= S_FFE_CHK;
+        end
+        S_FFE_CHK: begin
+          logic [6:0]  sb;
+          logic [7:0]  stp;
+          logic [31:0] sd1, sd2, sd3, sd4;
+          logic        ok;
+          sb  = {f_srci[2:0], 4'd0};
+          stp = dsc[sb][7:0];
+          sd1 = dsc[sb + 7'd1];
+          sd2 = dsc[sb + 7'd2];
+          sd3 = dsc[sb + 7'd3];
+          sd4 = dsc[sb + 7'd4];
+          ok  = !f_bad && f_has_fd && (f_srci < dsc_n);
+          f_lbasrc <= 1'b0;
+          if (f_fn == 8'h82) begin
+            ok = ok && stp == 8'h04 && sd1 != 32'd0 && sd1[1:0] == 2'b00 && sd1 <= 32'(rec_lim) &&
+                 sd2[1:0] == 2'b00 && (sd2 + sd1) <= cdw10;
+            if (f_has_fpd)
+              ok = ok && f_fpd1[15:8] == 8'h01 && f_fpd1[31:24] <= 8'd100 && f_fpd1[1:0] == 2'b00 &&
+                   f_fpd2 == 32'd0 && (f_fpd3 == 32'd0 || f_fpd3 == 32'd4096);
+            k_len <= sd1[23:0];
+            k_thr <= f_has_fpd ? f_fpd1[31:24] : 8'd0;
+            roff  <= sd2[23:0];
+          end else begin
+            if (stp == 8'h04) begin
+              ok = ok && sd1 != 32'd0 && sd2[1:0] == 2'b00 && (sd2 + sd1) <= cdw10;
+              k_len <= sd1[23:0];
+              roff  <= sd2[23:0];
+            end else if (stp == 8'h03) begin
+              ok = ok && (sd1 == 32'd0 || sd1 == 32'd1) && {sd3, sd2} < NSZE &&
+                   (NSZE - {sd3, sd2}) >= (64'(sd4[15:0]) + 64'd1) &&
+                   ((32'(sd4[15:0]) + 32'd1) << 12) <= 32'(MAX_REC) * 2;
+              f_lbasrc <= 1'b1;
+              k_slba   <= {sd3, sd2};
+              k_psz    <= 24'((32'(sd4[15:0]) + 32'd1) << 12);
+            end else begin
+              ok = 1'b0;
+            end
+            if (f_has_fpd) ok = ok && f_fpd1[7:0] == 8'h01 && f_fpd2 == 32'd0 && f_fpd3 == 32'd0;
+          end
+          if (!ok) begin
+            status              <= ST_INVALID_FIELD;
+            slot_busy[cur_slot] <= 1'b0;
+            st                  <= S_CQE_ROOM;
+          end else begin
+            xfer     <= cdw10[23:0];
+            to_host  <= 1'b0;
+            src      <= SRC_DDR;
+            ddr_addr <= slot_raw(cur_slot);
+            st       <= S_PRP;
+          end
+        end
 
         default: st <= S_OFF;
       endcase

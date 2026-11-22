@@ -8,7 +8,7 @@ module ddr_wr (
   input  logic         job_valid,
   output logic         job_ready,
   input  logic [31:0]  job_addr,      // 128-byte aligned
-  input  logic [17:0]  job_len,       // bytes, multiple of 128
+  input  logic [23:0]  job_len,       // bytes, multiple of 128
 
   input  logic [10:0]  src_avail,     // DWs available from dma_rd
   input  logic [31:0]  src_dw0,
@@ -34,14 +34,14 @@ module ddr_wr (
 );
 
   logic        active;
-  logic [10:0] nb;          // total bursts
-  logic [10:0] aw_cnt;      // bursts whose AW was sent
-  logic [10:0] w_cnt;       // bursts whose W data was fully sent
-  logic [10:0] b_cnt;       // B responses received
+  logic [16:0] nb;          // total bursts
+  logic [16:0] aw_cnt;      // bursts whose AW was sent
+  logic [16:0] w_cnt;       // bursts whose W data was fully sent
+  logic [16:0] b_cnt;       // B responses received
   logic [3:0]  beat;
   logic [31:0] addr;
 
-  assign awvalid = active && (aw_cnt != nb) && ((aw_cnt - b_cnt) < 11'd8);
+  assign awvalid = active && (aw_cnt != nb) && ((aw_cnt - b_cnt) < 17'd8);
   assign awaddr  = addr;
   assign awlen   = 8'd15;
   assign awsize  = 3'd3;
@@ -69,9 +69,9 @@ module ddr_wr (
       beat   <= '0;
       addr   <= '0;
     end else begin
-      if (job_valid && job_ready && job_len[17:7] != 11'd0) begin
+      if (job_valid && job_ready && job_len[23:7] != 17'd0) begin
         active <= 1'b1;
-        nb     <= job_len[17:7];
+        nb     <= job_len[23:7];
         aw_cnt <= '0;
         w_cnt  <= '0;
         b_cnt  <= '0;
@@ -79,16 +79,16 @@ module ddr_wr (
         addr   <= job_addr;
       end else if (active) begin
         if (awvalid && awready) begin
-          aw_cnt <= aw_cnt + 11'd1;
+          aw_cnt <= aw_cnt + 17'd1;
           addr   <= addr + 32'd128;
         end
         if (w_fire) begin
           beat <= beat + 4'd1;
-          if (wlast) w_cnt <= w_cnt + 11'd1;
+          if (wlast) w_cnt <= w_cnt + 17'd1;
         end
         if (bvalid) begin
-          b_cnt <= b_cnt + 11'd1;
-          if (b_cnt + 11'd1 == nb) active <= 1'b0;
+          b_cnt <= b_cnt + 17'd1;
+          if (b_cnt + 17'd1 == nb) active <= 1'b0;
         end
       end
     end

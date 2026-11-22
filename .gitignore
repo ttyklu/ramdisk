@@ -8,3 +8,6 @@ sim/*.pb
 sim/*.wdb
 sim/*.vcd
 sim/*.fst
+sim/obj_vl*/
+sim/codec_work/
+sim/zvec.hex

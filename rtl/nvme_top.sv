@@ -5,11 +5,14 @@
 //     class code 0x010802; MSI-X table size NV, table BAR0 offset 0x2000, PBA BAR0 offset 0x3000.
 //   * an AXI4 slave holding the RAM disk data (MIG DDR3 via an AXI interconnect / clock converter).
 // Everything runs on user_clk.
+// DDR map: namespace (NSZE x 4 KB) from DDR_BASE, then the compression staging ring (RING_MB).
 module nvme_top #(
   parameter int          NQ            = 4,
   parameter int          NV            = NQ + 1,
-  parameter logic [63:0] NSZE          = 64'd262144,      // 1 GB / 4 KB
+  parameter int          RING_MB       = 64,                // staging ring
+  parameter logic [63:0] NSZE          = 64'((1024 - RING_MB) * 256),   // 1 GB minus the ring, 4 KB blocks
   parameter logic [31:0] DDR_BASE      = 32'h0000_0000,
+  parameter int          REC_LOG2      = 17,                // largest record: 17 = 128 KB ... 20 = 1 MB
   parameter bit          PAYLOAD_BSWAP = 1'b0
 )(
   input  logic        clk,          // pcie_7x user_clk_out
@@ -71,6 +74,9 @@ module nvme_top #(
 
   localparam int RAW = 10;   // dma_rd ring: 1024 DWs
   localparam int FAW = 10;   // TX FIFO: 1024 DWs
+  localparam int          NSLOT     = (RING_MB << 20) >> (REC_LOG2 + 2);   // slot = 4 x record
+  localparam logic [31:0] RING_BASE = DDR_BASE + 32'(NSZE << 12);
+  localparam int          MAX_BLKS  = (2 << REC_LOG2) / 4096;
 
   wire [15:0] completer_id = {cfg_bus_number, cfg_device_number, cfg_function_number};
 
@@ -177,9 +183,13 @@ module nvme_top #(
   logic         ddrr_busy;
   logic         txf_flush;
 
-  assign txf_push = ddrr_busy ? ddrr_push : ctrl_push;
-  assign txf_dw0  = ddrr_busy ? ddrr_dw0  : ctrl_dw0;
-  assign txf_dw1  = ddrr_busy ? ddrr_dw1  : ctrl_dw1;
+  // xform (owns ddr_rd while busy) > ddr_rd (plain reads) > controller
+  logic         xf_busy;
+  logic [1:0]   xf_tx_push;
+  logic [31:0]  xf_tx_dw0, xf_tx_dw1;
+  assign txf_push = xf_busy ? xf_tx_push : ddrr_busy ? ddrr_push : ctrl_push;
+  assign txf_dw0  = xf_busy ? xf_tx_dw0  : ddrr_busy ? ddrr_dw0  : ctrl_dw0;
+  assign txf_dw1  = xf_busy ? xf_tx_dw1  : ddrr_busy ? ddrr_dw1  : ctrl_dw1;
 
   dw_fifo #(.AW(FAW)) u_txf (
     .clk, .rst, .flush(txf_flush),
@@ -204,12 +214,20 @@ module nvme_top #(
   // ---------------- DDR engines ----------------
   logic        ddrr_job_valid, ddrr_job_ready, ddrw_job_valid, ddrw_job_ready, ddrw_busy;
   logic [31:0] ddr_job_addr;
-  logic [17:0] ddr_job_len;
+  logic [23:0] ddr_job_len;
+  // xform side
+  logic         xf_rdj_valid, xf_wrj_valid;
+  logic [31:0]  xf_rdj_addr, xf_wrj_addr;
+  logic [23:0]  xf_rdj_len, xf_wrj_len;
+  logic [FAW:0] xf_rd_free, xf_wr_avail;
+  logic [31:0]  xf_wr_dw0, xf_wr_dw1;
+  logic [1:0]   ddrw_pop_all;
 
   ddr_rd #(.FAW(FAW)) u_ddrr (
     .clk, .rst,
-    .job_valid(ddrr_job_valid), .job_ready(ddrr_job_ready), .job_addr(ddr_job_addr), .job_len(ddr_job_len),
-    .fifo_free(txf_free),
+    .job_valid(xf_busy ? xf_rdj_valid : ddrr_job_valid), .job_ready(ddrr_job_ready),
+    .job_addr(xf_busy ? xf_rdj_addr : ddr_job_addr), .job_len(xf_busy ? xf_rdj_len : ddr_job_len),
+    .fifo_free(xf_busy ? xf_rd_free : txf_free),
     .araddr(m_axi_araddr), .arlen(m_axi_arlen), .arsize(m_axi_arsize), .arburst(m_axi_arburst),
     .arvalid(m_axi_arvalid), .arready(m_axi_arready),
     .rdata(m_axi_rdata), .rlast(m_axi_rlast), .rvalid(m_axi_rvalid), .rready(m_axi_rready),
@@ -219,8 +237,10 @@ module nvme_top #(
 
   ddr_wr u_ddrw (
     .clk, .rst,
-    .job_valid(ddrw_job_valid), .job_ready(ddrw_job_ready), .job_addr(ddr_job_addr), .job_len(ddr_job_len),
-    .src_avail(drd_avail), .src_dw0(drd_head0), .src_dw1(drd_head1), .src_pop(ddrw_pop),
+    .job_valid(xf_busy ? xf_wrj_valid : ddrw_job_valid), .job_ready(ddrw_job_ready),
+    .job_addr(xf_busy ? xf_wrj_addr : ddr_job_addr), .job_len(xf_busy ? xf_wrj_len : ddr_job_len),
+    .src_avail(xf_busy ? xf_wr_avail : drd_avail), .src_dw0(xf_busy ? xf_wr_dw0 : drd_head0),
+    .src_dw1(xf_busy ? xf_wr_dw1 : drd_head1), .src_pop(ddrw_pop_all),
     .awaddr(m_axi_awaddr), .awlen(m_axi_awlen), .awsize(m_axi_awsize), .awburst(m_axi_awburst),
     .awvalid(m_axi_awvalid), .awready(m_axi_awready),
     .wdata(m_axi_wdata), .wstrb(m_axi_wstrb), .wlast(m_axi_wlast), .wvalid(m_axi_wvalid), .wready(m_axi_wready),
@@ -228,8 +248,37 @@ module nvme_top #(
     .busy(ddrw_busy)
   );
 
+  assign ddrw_pop = xf_busy ? 2'd0 : ddrw_pop_all;
+
+  // ---------------- compression transform engine ----------------
+  logic         xf_start, xf_dst_tx, xf_done, xf_over;
+  logic [1:0]   xf_func;
+  logic [31:0]  xf_rd_addr, xf_wr_addr, xf_adler;
+  logic [23:0]  xf_rd_len, xf_in_len, xf_ck_len, xf_out_lim, xf_out_len, xf_wr_bytes, xf_consumed;
+  logic [4:0]   xf_skip;
+  logic [3:0]   xf_ierr;
+  logic [63:0]  xf_fia, xf_fib, xf_fic, xf_fid, xf_foa, xf_fob, xf_foc, xf_fod;
+
+  xform #(.FAW(FAW)) u_xf (
+    .clk, .rst,
+    .start(xf_start), .func(xf_func), .rd_addr(xf_rd_addr), .rd_len(xf_rd_len), .skip_dw(xf_skip),
+    .in_len(xf_in_len), .ck_len(xf_ck_len), .dst_tx(xf_dst_tx), .wr_addr(xf_wr_addr), .out_lim(xf_out_lim),
+    .busy(xf_busy), .done(xf_done), .out_len(xf_out_len), .wr_bytes(xf_wr_bytes), .over(xf_over),
+    .fia(xf_fia), .fib(xf_fib), .fic(xf_fic), .fid(xf_fid),
+    .foa(xf_foa), .fob(xf_fob), .foc(xf_foc), .fod(xf_fod),
+    .adler(xf_adler), .ierr(xf_ierr), .consumed(xf_consumed),
+    .rdj_valid(xf_rdj_valid), .rdj_ready(ddrr_job_ready), .rdj_addr(xf_rdj_addr), .rdj_len(xf_rdj_len),
+    .rd_busy(ddrr_busy), .rd_push(xf_busy ? ddrr_push : 2'd0), .rd_dw0(ddrr_dw0), .rd_dw1(ddrr_dw1),
+    .rd_free(xf_rd_free),
+    .wrj_valid(xf_wrj_valid), .wrj_ready(ddrw_job_ready), .wrj_addr(xf_wrj_addr), .wrj_len(xf_wrj_len),
+    .wr_busy(ddrw_busy), .wr_avail(xf_wr_avail), .wr_dw0(xf_wr_dw0), .wr_dw1(xf_wr_dw1),
+    .wr_pop(xf_busy ? ddrw_pop_all : 2'd0),
+    .tx_push(xf_tx_push), .tx_dw0(xf_tx_dw0), .tx_dw1(xf_tx_dw1), .tx_free(txf_free)
+  );
+
   // ---------------- command engine ----------------
-  nvme_ctrl #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .DDR_BASE(DDR_BASE), .RAW(RAW), .FAW(FAW)) u_ctrl (
+  nvme_ctrl #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .DDR_BASE(DDR_BASE), .RAW(RAW), .FAW(FAW),
+              .REC_LOG2(REC_LOG2), .MAX_BLKS(MAX_BLKS), .NSLOT(NSLOT), .RING_BASE(RING_BASE)) u_ctrl (
     .clk, .rst,
     .cc, .aqa, .asq, .acq, .csts_rdy, .sq_tail_db, .cq_head_db,
     .db_clr, .db_clr_sq, .db_clr_q,
@@ -241,7 +290,11 @@ module nvme_top #(
     .txf_push(ctrl_push), .txf_dw0(ctrl_dw0), .txf_dw1(ctrl_dw1), .txf_free,
     .ddrr_job_valid, .ddrr_job_ready, .ddrr_busy,
     .ddrw_job_valid, .ddrw_job_ready, .ddrw_busy,
-    .ddr_job_addr, .ddr_job_len, .data_to_ddr, .txf_flush
+    .ddr_job_addr, .ddr_job_len, .data_to_ddr, .txf_flush,
+    .xf_start, .xf_func, .xf_rd_addr, .xf_rd_len, .xf_skip, .xf_in_len, .xf_ck_len, .xf_dst_tx,
+    .xf_wr_addr, .xf_out_lim, .xf_busy, .xf_done, .xf_out_len, .xf_wr_bytes, .xf_over,
+    .xf_fi({xf_fid, xf_fic, xf_fib, xf_fia}), .xf_fo({xf_fod, xf_foc, xf_fob, xf_foa}),
+    .xf_adler, .xf_ierr, .xf_consumed
   );
 
 endmodule
