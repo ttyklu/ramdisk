@@ -1,0 +1,15 @@
+../rtl/nvme_pkg.sv
+../rtl/nvme_identify.sv
+../rtl/dw_ram2.sv
+../rtl/dw_fifo.sv
+../rtl/tlp_rx.sv
+../rtl/tlp_tx.sv
+../rtl/nvme_regs.sv
+../rtl/dma_rd.sv
+../rtl/mwr_eng.sv
+../rtl/ddr_rd.sv
+../rtl/ddr_wr.sv
+../rtl/nvme_ctrl.sv
+../rtl/nvme_top.sv
+../tb/axi_mem_model.sv
+../tb/tb_top.sv
