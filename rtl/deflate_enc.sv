@@ -136,7 +136,7 @@ module deflate_enc #(
   logic [LW-1:0] h_wd, h_q;
 
   typedef enum logic [3:0] {
-    S_IDLE, S_CLR, S_HDR, S_WAIT, S_RD2, S_RD3, S_HD, S_CMP, S_EMIT, S_EOB, S_FLUSH, S_TRL, S_DRAIN
+    S_IDLE, S_CLR, S_HDR, S_WAIT, S_RD2, S_RD3, S_HD, S_CMP, S_ENC, S_EMIT, S_EOB, S_FLUSH, S_TRL, S_DRAIN
   } st_t;
   st_t st;
 
@@ -282,14 +282,19 @@ module deflate_enc #(
             logic [8:0] fl;
             fl = (a_q == b_q) ? (mlen + 9'd1) : mlen;
             if (fl >= 9'd3) begin
-              pend <= match_bits(fl, mdist);
+              mlen <= fl;                         // encoded next cycle (keeps the RAM-out path short)
               p    <= p + LW'(fl);
+              st   <= S_ENC;
             end else begin
               pend <= lit_bits({1'b0, b0});
               p    <= p + 1'b1;
+              st   <= S_EMIT;
             end
-            st <= S_EMIT;
           end
+        end
+        S_ENC: begin
+          pend <= match_bits(mlen, mdist);
+          st   <= S_EMIT;
         end
         S_EMIT:  if (put_ok) st <= S_WAIT;
         S_EOB:   if (put_ok) st <= S_FLUSH;

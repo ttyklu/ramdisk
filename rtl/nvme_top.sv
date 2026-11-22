@@ -1,7 +1,7 @@
 // nvme_top.sv - NVMe RAM disk controller top level
 // Connects to:
-//   * Xilinx 7 Series Integrated Block for PCI Express (pcie_7x), 64-bit AXI-Stream, Gen2 x4,
-//     user_clk = 250 MHz. Configure the core with: BAR0 = 64-bit memory, 16 KB;
+//   * Xilinx 7 Series Integrated Block for PCI Express (pcie_7x), 128-bit AXI-Stream, Gen2 x4,
+//     user_clk = 125 MHz. RX TLPs may straddle (is_sof / is_eof in rx_tuser). Configure the core with: BAR0 = 64-bit memory, 16 KB;
 //     class code 0x010802; MSI-X table size NV, table BAR0 offset 0x2000, PBA BAR0 offset 0x3000.
 //   * an AXI4 slave holding the RAM disk data (MIG DDR3 via an AXI interconnect / clock converter).
 // Everything runs on user_clk.
@@ -19,16 +19,14 @@ module nvme_top #(
   input  logic        rst,          // pcie_7x user_reset_out (active high)
 
   // pcie_7x RX (m_axis_rx_*)
-  input  logic [63:0] rx_tdata,
-  input  logic [7:0]  rx_tkeep,
-  input  logic        rx_tlast,
+  input  logic [127:0] rx_tdata,
   input  logic        rx_tvalid,
   output logic        rx_tready,
-  input  logic [21:0] rx_tuser,
+  input  logic [21:0] rx_tuser,     // [8:2] bar_hit, [14:10] is_sof, [21:17] is_eof
 
   // pcie_7x TX (s_axis_tx_*)
-  output logic [63:0] tx_tdata,
-  output logic [7:0]  tx_tkeep,
+  output logic [127:0] tx_tdata,
+  output logic [15:0] tx_tkeep,
   output logic        tx_tlast,
   output logic        tx_tvalid,
   input  logic        tx_tready,
@@ -80,6 +78,27 @@ module nvme_top #(
 
   wire [15:0] completer_id = {cfg_bus_number, cfg_device_number, cfg_function_number};
 
+  // ---------------- 128-bit core interface <-> 64-bit TLP beats ----------------
+  logic [63:0] rx64_tdata, tx64_tdata;
+  logic [7:0]  rx64_tkeep, tx64_tkeep;
+  logic        rx64_tlast, rx64_tvalid, rx64_tready, tx64_tlast, tx64_tvalid, tx64_tready;
+  logic [21:0] rx64_tuser;
+  logic [3:0]  tx64_tuser;
+
+  rx128_to_64 u_rx128 (
+    .clk, .rst,
+    .s_tdata(rx_tdata), .s_tvalid(rx_tvalid), .s_tready(rx_tready), .s_tuser(rx_tuser),
+    .m_tdata(rx64_tdata), .m_tkeep(rx64_tkeep), .m_tlast(rx64_tlast), .m_tvalid(rx64_tvalid),
+    .m_tready(rx64_tready), .m_tuser(rx64_tuser)
+  );
+  tx64_to_128 u_tx128 (
+    .clk, .rst,
+    .s_tdata(tx64_tdata), .s_tkeep(tx64_tkeep), .s_tlast(tx64_tlast), .s_tvalid(tx64_tvalid),
+    .s_tready(tx64_tready), .s_tuser(tx64_tuser),
+    .m_tdata(tx_tdata), .m_tkeep(tx_tkeep), .m_tlast(tx_tlast), .m_tvalid(tx_tvalid),
+    .m_tready(tx_tready), .m_tuser(tx_tuser)
+  );
+
   // ---------------- tlp_rx ----------------
   logic        creq_valid, creq_ready, creq_wr;
   logic [11:0] creq_dwaddr;
@@ -100,7 +119,8 @@ module nvme_top #(
 
   tlp_rx #(.PAYLOAD_BSWAP(PAYLOAD_BSWAP)) u_rx (
     .clk, .rst,
-    .rx_tdata, .rx_tkeep, .rx_tlast, .rx_tvalid, .rx_tready, .rx_tuser,
+    .rx_tdata(rx64_tdata), .rx_tkeep(rx64_tkeep), .rx_tlast(rx64_tlast), .rx_tvalid(rx64_tvalid),
+    .rx_tready(rx64_tready), .rx_tuser(rx64_tuser),
     .creq_valid, .creq_ready, .creq_wr, .creq_dwaddr, .creq_len, .creq_fbe, .creq_lbe,
     .creq_d0, .creq_d1, .creq_rid, .creq_tag, .creq_tc, .creq_attr,
     .cpl_hdr_valid, .cpl_tag, .cpl_la, .cpl_status, .cpl_len, .cpl_hasdata,
@@ -128,7 +148,8 @@ module nvme_top #(
 
   tlp_tx #(.PAYLOAD_BSWAP(PAYLOAD_BSWAP)) u_tx (
     .clk, .rst, .completer_id,
-    .tx_tdata, .tx_tkeep, .tx_tlast, .tx_tvalid, .tx_tready, .tx_tuser,
+    .tx_tdata(tx64_tdata), .tx_tkeep(tx64_tkeep), .tx_tlast(tx64_tlast), .tx_tvalid(tx64_tvalid),
+    .tx_tready(tx64_tready), .tx_tuser(tx64_tuser),
     .c_valid, .c_ready, .c_rid, .c_tag, .c_tc, .c_attr, .c_status, .c_la, .c_bc, .c_len, .c_d0, .c_d1,
     .r_valid, .r_ready, .r_addr, .r_len, .r_tag,
     .w_valid, .w_ready, .w_addr, .w_len, .w_done, .w_pop, .w_dw0(txf_head0), .w_dw1(txf_head1)

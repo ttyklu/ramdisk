@@ -51,6 +51,9 @@ module inflate (
   logic [8:0]  li, ntot, dbi;              // lens index, lens count, dist lens base
   logic [1:0]  bpass;                      // table being built: 0 = code-length, 1 = lit/len, 2 = dist
   logic [8:0]  bi, bn;
+  logic [3:0]  bk;                         // S_BOFF: code length being processed
+  logic signed [17:0] bleft;               // codes left (over-subscription check)
+  logic [8:0]  bo;                         // running offset
   logic [15:0] code, first, index;
   logic [4:0]  dlen;
   logic [1:0]  dtab;
@@ -297,8 +300,13 @@ module inflate (
 
         // zlib header: CMF, FLG
         S_ZHDR: if (tk) begin
+          // (CMF * 256 + FLG) % 31 == 0, using 32 = 1 (mod 31): sum the 5-bit chunks
+          logic [15:0] v;
+          logic [6:0]  m;
+          v = {bitbuf[7:0], bitbuf[15:8]};
+          m = 7'(v[4:0]) + 7'(v[9:5]) + 7'(v[14:10]) + 7'(v[15]);
           if (bitbuf[3:0] != 4'd8 || bitbuf[7:4] > 4'd7 || bitbuf[13] ||
-              ((32'(bitbuf[7:0]) * 256 + 32'(bitbuf[15:8])) % 31) != 0)
+              !(m == 7'd0 || m == 7'd31 || m == 7'd62 || m == 7'd93))
             fail(E_HDR);
           else
             st <= S_BHDR;
@@ -366,8 +374,10 @@ module inflate (
         // ---- generic canonical table build ----
         S_BCNT: begin
           if (bi == bn) begin
-            for (int k = 0; k < 16; k++) offs[k] <= '0;
-            st <= S_BOFF;
+            bk    <= 4'd1;
+            bleft <= 18'sd1;
+            bo    <= '0;
+            st    <= S_BOFF;
           end else begin
             logic [3:0] l;
             l = getlen(bpass, bi);
@@ -377,22 +387,19 @@ module inflate (
             bi <= bi + 9'd1;
           end
         end
+        // offsets and over-subscription check, one code length per cycle
         S_BOFF: begin
-          int left;
-          logic [8:0] o;
-          logic [8:0] c;
-          left = 1;
-          o    = '0;
-          for (int k = 1; k < 16; k++) begin
-            c = (bpass == 2'd0) ? ccnt[k] : (bpass == 2'd1) ? lcnt[k] : dcnt[k];
-            offs[k] <= o;
-            o    = o + c;
-            left = left * 2 - int'(c);
-            if (left < 0) left = -100000;
-          end
-          bi <= '0;
-          if (left < 0) fail(E_CODES);
-          else st <= S_BSYM;
+          logic [8:0]         c;
+          logic signed [17:0] l;
+          c = (bpass == 2'd0) ? ccnt[bk] : (bpass == 2'd1) ? lcnt[bk] : dcnt[bk];
+          l = (bleft <<< 1) - 18'(c);
+          offs[bk] <= bo;
+          bo       <= bo + c;
+          bleft    <= l;
+          bk       <= bk + 4'd1;
+          bi       <= '0;
+          if (l < 0)            fail(E_CODES);
+          else if (bk == 4'd15) st <= S_BSYM;
         end
         S_BSYM: begin
           if (bi == bn) begin

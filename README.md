@@ -9,13 +9,15 @@ Interface: [docs/compression_spec.md](docs/compression_spec.md).
 
 **Status:** the self-checking testbench passes in both Vivado xsim 2026.1 and Verilator 5.032,
 for 128 KB records (20/20 random seeds) and the optional 1 MB build. The deflate / inflate
-engines also pass 494 unit checks against Python's zlib. Not yet synthesized or tried on hardware.
+engines also pass 494 unit checks against Python's zlib. Out-of-context place and route on the
+ZC706 part (xc7z045ffg900-2) meets timing at 125 MHz for both builds (WNS +0.15 ns at 128 KB,
++0.30 ns at 1 MB). Not yet integrated with the PCIe / MIG IP or tried on hardware.
 
 ## What is implemented
 
 | Area | Details |
 | --- | --- |
-| PCIe | 7 Series Integrated Block (`pcie_7x`) 64-bit AXI-Stream, Gen2 x4, 250 MHz `user_clk` |
+| PCIe | 7 Series Integrated Block (`pcie_7x`) 128-bit AXI-Stream, Gen2 x4, 125 MHz `user_clk`; RX straddling handled (`rx128_to_64`, `tx64_to_128` adapt to the internal 64-bit TLP beats) |
 | BAR0 (16 KB) | CAP / VS (2.4) / INTMS / INTMC / CC / CSTS / AQA / ASQ / ACQ, doorbells at 0x1000 (DSTRD = 0), MSI-X table at 0x2000, PBA at 0x3000 |
 | Queues | Admin + 4 I/O queue pairs (`NQ`), up to 4096 entries each, physically contiguous only |
 | Admin commands | Identify (CNS 0, 1, 2; any other CNS returns 4 KB of zeros), Get Log Page (SMART has temperature/spare, others zero), Set/Get Features (Number of Queues answered, others accepted), Create/Delete I/O SQ/CQ, Abort, Asynchronous Event Request (held, never completed) |
@@ -103,11 +105,26 @@ on two I/O queues. Every read is compared against a disk model. Completions to t
 controller's reads are split at 64 B boundaries and interleaved across tags; the TX
 interface and the DDR model apply random backpressure.
 
+## FPGA build (out of context)
+
+```bash
+cd ~/ramdisk/fpga
+vivado -mode batch -source ooc_build.tcl -tclargs 17 route 8.0    # 128 KB build, 125 MHz
+vivado -mode batch -source ooc_build.tcl -tclargs 20 route 8.0    # 1 MB build
+```
+
+Reports land in `fpga/reports_rec<N>/`. `fpga/quick_mod.tcl` runs one module for timing work.
+
+| Build | LUTs | Flip-flops | RAMB36 | WNS at 8 ns |
+| --- | --- | --- | --- | --- |
+| 128 KB records | 28,756 (13%) | 16,596 (4%) | 50 (9%) | +0.154 ns |
+| 1 MB records | 33,068 (15%) | 37,937 (9%) | 50 (9%) | +0.297 ns |
+
 ## Hardware integration (next round)
 
 `pcie_7x` settings the RTL assumes:
 
-- Gen2 (5.0 GT/s) x4, 64-bit AXI-Stream interface, 250 MHz
+- Gen2 (5.0 GT/s) x4, 128-bit AXI-Stream interface, 125 MHz
 - BAR0: 64-bit memory BAR, 16 KB, not prefetchable; no other BARs
 - Class code `0x010802` (mass storage / NVM / NVMe)
 - MSI-X capability: table size 5, table in BAR0 at offset 0x2000, PBA in BAR0 at 0x3000; MSI off
@@ -129,7 +146,9 @@ interconnect to the MIG DDR3 SODIMM controller.
 - One command at a time: performance is not tuned yet. A compress blocks other I/O while it runs.
 - Compression uses fixed Huffman codes only: text compresses to about 29% (zlib level 6: 12%).
   A dynamic-Huffman encoder is the next ratio step.
-- Engines run at about 130 MB/s (deflate) and 145 MB/s (inflate) at 250 MHz, below the
+- The internal datapath moves 8 bytes per cycle: about 1 GB/s each way at 125 MHz, below the
+  ~1.6 GB/s the link can carry. Widening the DMA paths to 4 DWs would close the gap.
+- Engines run at about 65 MB/s (deflate) and 70 MB/s (inflate) at 125 MHz, below the
   200-250 MB/s target; match finding and Huffman decoding are bit- / byte-serial.
 - Staging slots are freed by Commit, FFE-Receive, Commit with DISCARD or a controller reset; there
   is no timeout yet.

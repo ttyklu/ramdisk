@@ -11,3 +11,8 @@ sim/*.fst
 sim/obj_vl*/
 sim/codec_work/
 sim/zvec.hex
+fpga/reports_*/
+fpga/.Xil/
+fpga/*.jou
+fpga/*.log
+fpga/vivado*.str

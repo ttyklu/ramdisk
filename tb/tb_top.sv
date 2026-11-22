@@ -24,12 +24,12 @@ module tb_top #(
 
   // ---------------- clock / reset ----------------
   logic clk = 1'b0;
-  always #2 clk = ~clk;               // 250 MHz
+  always #4 clk = ~clk;               // 125 MHz (PCIe user_clk, 128-bit interface)
   logic rst;
 
   // ---------------- DUT ----------------
-  logic [63:0] rx_tdata;  logic [7:0] rx_tkeep; logic rx_tlast, rx_tvalid, rx_tready; logic [21:0] rx_tuser;
-  logic [63:0] tx_tdata;  logic [7:0] tx_tkeep; logic tx_tlast, tx_tvalid, tx_tready; logic [3:0]  tx_tuser;
+  logic [127:0] rx_tdata; logic rx_tvalid, rx_tready; logic [21:0] rx_tuser;
+  logic [127:0] tx_tdata; logic [15:0] tx_tkeep; logic tx_tlast, tx_tvalid, tx_tready; logic [3:0] tx_tuser;
   logic [31:0] awaddr, araddr; logic [7:0] awlen, arlen; logic [2:0] awsize, arsize; logic [1:0] awburst, arburst;
   logic awvalid, awready, wlast, wvalid, wready, bvalid, bready, arvalid, arready, rlast, rvalid, rready;
   logic [63:0] wdata, rdata; logic [7:0] wstrb; logic [1:0] bresp, rresp;
@@ -37,7 +37,7 @@ module tb_top #(
 
   nvme_top #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .REC_LOG2(REC_LOG2), .PAYLOAD_BSWAP(BSWAP)) dut (
     .clk, .rst,
-    .rx_tdata, .rx_tkeep, .rx_tlast, .rx_tvalid, .rx_tready, .rx_tuser,
+    .rx_tdata, .rx_tvalid, .rx_tready, .rx_tuser,
     .tx_tdata, .tx_tkeep, .tx_tlast, .tx_tvalid, .tx_tready, .tx_tuser,
     .cfg_bus_number(8'h01), .cfg_device_number(5'd1), .cfg_function_number(3'd0),
     .cfg_interrupt_msixenable(1'b1), .cfg_interrupt_msixfm(1'b0),
@@ -110,38 +110,66 @@ module tb_top #(
     return BSWAP ? bswap32(d) : d;
   endfunction
 
-  // ---------------- RX driver (host -> device beats) ----------------
-  bit [63:0] rxq_d[$];
-  bit [7:0]  rxq_k[$];
-  bit        rxq_l[$];
-  bit [21:0] rxq_u[$];
+  // ---------------- RX driver (host -> device, 7-series 128-bit format) ----------------
+  // TLPs are queued as DWs; each beat carries up to 4 DWs. A TLP may start at DW0 or DW2;
+  // after a TLP ends in DW0/DW1 the next one sometimes starts at DW2 of the same beat
+  // (straddle). rx_tuser: [8:2] bar_hit, [14:10] is_sof, [21:17] is_eof.
+  bit [31:0] rxq_dw[$];
+  bit        rxq_first[$], rxq_last[$];
+  bit [6:0]  rxq_bar[$];
+  int        rxq_tlps = 0;              // complete TLPs queued (for back-pressure in the TB)
+  bit        rx_open  = 0;              // a TLP continues into the next beat
+  int        n_straddle = 0, n_sof2 = 0;  // beats where a TLP ends and the next starts; starts at DW2
 
-  function automatic void push_beat(input bit [63:0] d, input bit [7:0] k, input bit l, input bit [21:0] u);
-    rxq_d.push_back(d); rxq_k.push_back(k); rxq_l.push_back(l); rxq_u.push_back(u);
-  endfunction
-
-  // push a TLP given as a DW list
   function automatic void push_tlp(input bit [31:0] dws[$], input bit [21:0] u);
-    int n;
-    n = dws.size();
-    for (int i = 0; i < n; i += 2) begin
-      bit last;
-      last = (i + 2 >= n);
-      if (i + 1 < n) push_beat({dws[i+1], dws[i]}, 8'hFF, last, u);
-      else           push_beat({32'd0,    dws[i]}, 8'h0F, last, u);
+    foreach (dws[i]) begin
+      rxq_dw.push_back(dws[i]);
+      rxq_first.push_back(i == 0);
+      rxq_last.push_back(i == dws.size() - 1);
+      rxq_bar.push_back(u[8:2]);
     end
+    rxq_tlps++;
   endfunction
 
   always @(posedge clk) begin
     if (rst) begin
       rx_tvalid <= 1'b0;
-      rx_tlast  <= 1'b0;
+      rx_open   =  0;
     end else if (!rx_tvalid || rx_tready) begin
-      if (rxq_d.size() > 0 && $urandom_range(0, 7) != 0) begin
-        rx_tdata  <= rxq_d.pop_front();
-        rx_tkeep  <= rxq_k.pop_front();
-        rx_tlast  <= rxq_l.pop_front();
-        rx_tuser  <= rxq_u.pop_front();
+      if (rxq_dw.size() > 0 && $urandom_range(0, 7) != 0) begin
+        bit [127:0] d;
+        bit [21:0]  u;
+        int         k;
+        d = '0; u = '0; k = 0;
+        // a new TLP may start at DW2 (rarely without a straddle)
+        if (!rx_open && $urandom_range(0, 15) == 0) k = 2;
+        while (k < 4 && rxq_dw.size() > 0) begin
+          bit f, l;
+          f = rxq_first[0]; l = rxq_last[0];
+          if (f && rx_open) break;                         // never happens: open TLP first
+          if (f && k == 1) k = 2;                          // a TLP starts at DW0 or DW2 only
+          if (f && k == 3) break;
+          if (f && u[14]) break;                           // one start per beat
+          if (f) begin
+            u[14] = 1'b1; u[13:10] = 4'(k * 4); u[8:2] = rxq_bar[0];
+            rx_open = 1;
+          end
+          d[32*k +: 32] = rxq_dw.pop_front();
+          void'(rxq_first.pop_front()); void'(rxq_last.pop_front()); void'(rxq_bar.pop_front());
+          if (l) begin
+            u[21] = 1'b1; u[20:17] = 4'(k * 4 + 3);
+            rx_open = 0;
+            rxq_tlps--;
+            k++;
+            if (k <= 2 && $urandom_range(0, 1) == 0) break;  // sometimes no straddle
+            continue;
+          end
+          k++;
+        end
+        if (u[14] && u[13:10] == 4'd8) n_sof2++;
+        if (u[14] && u[21] && u[13:10] > u[20:17]) n_straddle++;
+        rx_tdata  <= d;
+        rx_tuser  <= u;
         rx_tvalid <= 1'b1;
       end else begin
         rx_tvalid <= 1'b0;
@@ -199,7 +227,7 @@ module tb_top #(
   endtask
 
   // ---------------- TX monitor (device -> host) ----------------
-  bit [63:0] txb[$];
+  bit [31:0] txb[$];          // DWs of the TLP being received
   int        msi_cnt [NV];
   int        n_mwr = 0, n_mrd = 0;
 
@@ -218,7 +246,7 @@ module tb_top #(
     int        len, hdr;
     bit [63:0] addr;
     dw.delete();
-    foreach (txb[i]) begin dw.push_back(txb[i][31:0]); dw.push_back(txb[i][63:32]); end
+    foreach (txb[i]) dw.push_back(txb[i]);
     h0  = dw[0];
     h1  = dw[1];
     fmt = h0[31:29];
@@ -279,7 +307,7 @@ module tb_top #(
       tx_tready <= 1'b0;
     end else begin
       if (tx_tvalid && tx_tready) begin
-        txb.push_back(tx_tdata);
+        for (int k = 0; k < 4; k++) if (tx_tkeep[4 * k]) txb.push_back(tx_tdata[32*k +: 32]);
         if (tx_tlast) begin
           handle_tx_tlp();
           txb.delete();
@@ -291,7 +319,7 @@ module tb_top #(
 
   // completion scheduler: random pending read, next chunk (RCB = 64 B), CplD to device
   always @(posedge clk) begin
-    if (!rst && pend_tag.size() > 0 && rxq_d.size() < 32 && $urandom_range(0, 2) == 0) begin
+    if (!rst && pend_tag.size() > 0 && rxq_tlps < 16 && $urandom_range(0, 2) == 0) begin
       int        i, rem, bnd, nb;
       bit [63:0] a;
       bit [31:0] t[$];
@@ -661,6 +689,7 @@ module tb_top #(
     $display("MRd TLPs: %0d  MWr TLPs: %0d  MSI-X per vector: %0d %0d %0d",
              n_mrd, n_mwr, msi_cnt[0], msi_cnt[1], msi_cnt[2]);
     $display("DDR bursts: %0d AW, %0d W, %0d B", u_ddr.n_aw, u_ddr.n_w, u_ddr.n_b);
+    $display("RX beats: %0d straddled, %0d TLP starts at DW2", n_straddle, n_sof2);
     if (errors == 0) $display("TEST PASSED");
     else             $display("TEST FAILED (%0d errors)", errors);
     $finish;

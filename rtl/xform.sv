@@ -151,6 +151,7 @@ module xform #(
   logic [21:0] pushed;        // DWs pushed to the sink (DDR or TX)
   logic [21:0] ck_fed;        // DWs given to Fletcher-in
   logic [11:0] pages;         // 4 KB write jobs issued
+  logic [21:0] tx_rem;        // TX destination: DWs still allowed (out_lim / 4 - pushed)
 
   wire [FAW:0] sink_free = totx ? tx_free : xo_free;
   wire [21:0]  lim_dw    = 22'(lim >> 2);
@@ -217,11 +218,14 @@ module xform #(
       endcase
     end
     // output zero padding
-    if (xs == X_PAD && pushed < tgt_dw && sink_free >= 2) begin
-      push_n = (tgt_dw - pushed >= 22'd2) ? 2'd2 : 2'd1;
+    if (xs == X_PAD && (totx ? (tx_rem != 22'd0) : (pushed < tgt_dw)) && sink_free >= 2) begin
+      push_n = (totx ? (tx_rem == 22'd1) : (pushed[9:0] == 10'h3FF)) ? 2'd1 : 2'd2;
     end
     // TX destination is exact: never push past out_lim
-    if (totx && pushed + 22'(push_n) > lim_dw) push_n = (pushed < lim_dw) ? 2'd1 : 2'd0;
+    if (totx) begin
+      if (tx_rem == 22'd0)                         push_n = 2'd0;
+      else if (tx_rem == 22'd1 && push_n == 2'd2)  push_n = 2'd1;
+    end
   end
   assign xin_pop = pop_n;
 
@@ -283,6 +287,7 @@ module xform #(
         pk        <= '0;
         pkn       <= '0;
         pushed    <= '0;
+        tx_rem    <= 22'(out_lim >> 2);
         ck_fed    <= '0;
         pages     <= '0;
         over      <= 1'b0;
@@ -292,6 +297,7 @@ module xform #(
       end else begin
         popped <= popped + 22'(pop_n);
         pushed <= pushed + 22'(push_n);
+        tx_rem <= tx_rem - 22'(totx ? push_n : 2'd0);
         ck_fed <= ck_fed + 22'(ck_n);
         if (wrj_fire) pages <= pages + 12'd1;
 
@@ -335,7 +341,8 @@ module xform #(
           X_RUN:  if (all_popped && !rd_busy && func_done) xs <= X_FLUSH;
           X_FLUSH: if (pkn == 2'd0 || push_n != 2'd0) xs <= X_PAD;
           X_PAD: begin
-            if (pushed + 22'(push_n) >= tgt_dw && (ck_fed[9:0] == 10'd0 || ck_fed[9:0] + 10'(ck_n) == 10'd0)) xs <= X_WAIT;
+            // registered values only (one extra cycle, short path)
+            if ((totx ? (tx_rem == 22'd0) : (pushed >= tgt_dw)) && ck_fed[9:0] == 10'd0) xs <= X_WAIT;
           end
           X_WAIT: begin
             if (totx || ({pages, 10'd0} >= pushed && !wr_busy && xo_cnt == '0 && !wrj_valid)) begin

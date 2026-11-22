@@ -3,6 +3,8 @@
 ../rtl/ram_1r1w.sv
 ../rtl/dw_ram2.sv
 ../rtl/dw_fifo.sv
+../rtl/rx128_to_64.sv
+../rtl/tx64_to_128.sv
 ../rtl/tlp_rx.sv
 ../rtl/tlp_tx.sv
 ../rtl/nvme_regs.sv

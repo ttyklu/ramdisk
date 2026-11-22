@@ -112,7 +112,7 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
     S_CQE_ROOM, S_CQE_PUSH0, S_CQE_PUSH1, S_CQE_JOB, S_CQE_WAIT,
     S_INT, S_INT_PUSH, S_INT_JOB, S_INT_WAIT,
     S_POST, S_XF_WAIT, S_C2S_FIN, S_DEC_FIN, S_SLOT_WR, S_RES_GEN, S_RES_JOB, S_RES_WAIT,
-    S_SLOT_RD, S_COMMIT_CHK, S_RECV_CHK, S_FREE_CQE,
+    S_SLOT_RD, S_SLOT_RD2, S_COMMIT_CHK, S_RECV_CHK, S_FREE_CQE,
     S_MD_FETCH, S_MD_RD, S_DREAD_GO, S_DESC_FETCH, S_DESC_RD, S_DESC_PARSE, S_FFE_CHK, S_FFE_DEST
   } st_t;
   st_t st;
@@ -193,7 +193,7 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
   logic [NSLOT-1:0] slot_busy, slot_ffe;
   logic [15:0]      slot_lid [NSLOT];
   logic [511:0]     slot_mem [NSLOT];        // CRB per slot (block RAM)
-  logic [511:0]     srec;
+  logic [511:0]     srec, srec_raw;      // block RAM output, then a flop stage
   logic [SW-1:0]    cur_slot;
   logic [31:0]      crb [16];
   kind_t            kind;
@@ -235,16 +235,22 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
     return (v + 24'h7F) & 24'hFF_FF80;
   endfunction
 
-  // first free slot, and the busy FFE slot holding this command's List ID
+  // first free slot, and the busy FFE slot holding this command's List ID. Registered: slot
+  // state and CDW2 settle many cycles before the command is decoded, so one cycle of delay
+  // is always safe.
   logic          have_free, have_lid;
   logic [SW-1:0] free_idx, lid_idx;
-  always_comb begin
-    have_free = 1'b0; free_idx = '0;
-    have_lid  = 1'b0; lid_idx  = '0;
+  always_ff @(posedge clk) begin
+    logic          hf, hl;
+    logic [SW-1:0] fi, li_;
+    hf = 1'b0; fi = '0;
+    hl = 1'b0; li_ = '0;
     for (int k = NSLOT - 1; k >= 0; k--) begin
-      if (!slot_busy[k]) begin have_free = 1'b1; free_idx = SW'(k); end
-      if (slot_busy[k] && slot_ffe[k] && slot_lid[k] == cmd[2][15:0]) begin have_lid = 1'b1; lid_idx = SW'(k); end
+      if (!slot_busy[k]) begin hf = 1'b1; fi = SW'(k); end
+      if (slot_busy[k] && slot_ffe[k] && slot_lid[k] == cmd[2][15:0]) begin hl = 1'b1; li_ = SW'(k); end
     end
+    have_free <= hf; free_idx <= fi;
+    have_lid  <= hl; lid_idx  <= li_;
   end
 
   // ---------------- helpers ----------------
@@ -1084,7 +1090,11 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
         end
 
         S_SLOT_RD: begin
-          srec <= slot_mem[cur_slot];
+          srec_raw <= slot_mem[cur_slot];
+          st       <= S_SLOT_RD2;
+        end
+        S_SLOT_RD2: begin
+          srec <= srec_raw;
           st   <= (kind == K_COMMIT) ? S_COMMIT_CHK : S_RECV_CHK;
         end
 

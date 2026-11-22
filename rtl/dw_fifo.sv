@@ -28,17 +28,21 @@ module dw_fifo #(
     .rd1  (head1)
   );
 
+  // count / free are registered but exact: computed from the next pointer values
+  wire [AW:0] wp_n = wp + push_cnt;
+  wire [AW:0] rp_n = rp + pop_cnt;
   always_ff @(posedge clk) begin
     if (rst || flush) begin
-      wp <= '0;
-      rp <= '0;
+      wp    <= '0;
+      rp    <= '0;
+      count <= '0;
+      free  <= (AW+1)'(1 << AW);
     end else begin
-      wp <= wp + push_cnt;
-      rp <= rp + pop_cnt;
+      wp    <= wp_n;
+      rp    <= rp_n;
+      count <= wp_n - rp_n;
+      free  <= (AW+1)'(1 << AW) - (wp_n - rp_n);
     end
   end
-
-  assign count = wp - rp;
-  assign free  = (AW+1)'(1 << AW) - count;
 
 endmodule
