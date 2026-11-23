@@ -16,3 +16,9 @@ fpga/.Xil/
 fpga/*.jou
 fpga/*.log
 fpga/vivado*.str
+fpga/zc706/ip/
+fpga/zc706/out/
+fpga/zc706/*.log
+fpga/zc706/*.jou
+fpga/zc706/.Xil/
+fpga/zc706/*.str
