@@ -131,7 +131,7 @@ module zc706_top #(
   logic [7:0]  n_wstrb;
   logic        dma_err;
 
-  nvme_top #(.REC_LOG2(REC_LOG2)) u_nvme (
+  nvme_top #(.REC_LOG2(REC_LOG2), .PAYLOAD_BSWAP(1'b1)) u_nvme (   // pcie_7x AXIS payload DWs are byte-reversed
     .clk(user_clk), .rst(user_reset),
     .rx_tdata, .rx_tvalid, .rx_tready, .rx_tuser,
     .tx_tdata, .tx_tkeep, .tx_tlast, .tx_tvalid, .tx_tready, .tx_tuser,

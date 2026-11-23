@@ -1,7 +1,7 @@
 // nvme_ctrl.sv - NVMe command engine (one command at a time).
 //  * Controller enable / disable / shutdown, admin queue setup from AQA/ASQ/ACQ
 //  * Round-robin arbitration over the admin SQ and up to NQ I/O SQs
-//  * Admin commands handled in hardware: Identify (CNS 0/1/2, others return zeros),
+//  * Admin commands handled in hardware: Identify (CNS 0/1/2/8, others return zeros),
 //    Get Log Page, Set/Get Features, Create/Delete I/O SQ/CQ, Abort, Async Event Request
 //  * NVM commands: Read, Write, Flush; 4 KB LBAs, MDTS = 2 x largest record
 //  * Compression (docs/compression_spec.md): Set/Get Features C0h (RAW by default),
@@ -270,6 +270,9 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
           if (i == 11'd19) r[15:8] = MDTS_V;          // byte 77: MDTS from the build
         end
         8'h02: r = (i == 11'd0) ? 32'd1 : 32'd0;     // active NS list: NSID 1
+        // I/O command set independent Identify NS (Linux uses it when VS >= 2.0):
+        // byte 14 NSTAT.NRDY = 1, everything else zero (not shared, not read-only)
+        8'h08: r = (i == 11'd3) ? 32'h0001_0000 : 32'd0;
         default: r = 32'd0;
       endcase
     end else if (s == SRC_CRB) begin

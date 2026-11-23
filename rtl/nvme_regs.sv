@@ -73,6 +73,8 @@ module nvme_regs import nvme_pkg::*; #(
   localparam logic [31:0] CAP_LO = {8'd20, 5'd0, 2'b00, 1'b1, MQES};
   localparam logic [31:0] CAP_HI = {3'd0, 1'b0, 1'b1, 3'd0, 4'd0, 4'd0, 2'b00, 1'b0, 8'h01, 1'b0, 4'd0};
   localparam logic [31:0] VS     = 32'h0002_0400;   // NVMe 2.4
+  // CRTO (0x68): CRWMT = CRIMT = 20 x 500 ms, same as CAP.TO (required since CAP.CRMS.CRWMS = 1)
+  localparam logic [31:0] CRTO   = {16'd20, 16'd20};
 
   wire [31:0] csts = {28'd0, (cc[15:14] != 2'b00) ? 2'b10 : 2'b00, 1'b0, csts_rdy};
 
@@ -94,6 +96,7 @@ module nvme_regs import nvme_pkg::*; #(
         12'h00B: r = asq[63:32];
         12'h00C: r = acq[31:0];
         12'h00D: r = acq[63:32];
+        12'h01A: r = CRTO;
         default: r = 32'd0;
       endcase
     end else if (a >= 12'h800 && a < 12'h800 + 4*NV) begin

@@ -14,7 +14,7 @@ module tb_top #(
   import nvme_pkg::*;
 
   // ---------------- configuration ----------------
-  localparam bit          BSWAP    = 1'b0;
+  localparam bit          BSWAP    = 1'b1;   // match pcie_7x AXIS payload byte order (as on the board)
   localparam int          NQ       = 4;
   localparam int          NV       = NQ + 1;
   localparam logic [63:0] NSZE     = 64'd245760;   // 1 GB minus the 64 MB staging ring
@@ -531,6 +531,8 @@ module tb_top #(
     if (r[15:0] != 16'd4095 || !r[16]) fail("CAP.MQES/CQR");
     mmio_read32(32'h4, r);  $display("CAP.hi = %h", r);
     if (r[5] != 1'b1) fail("CAP.CSS NVM bit");
+    mmio_read32(32'h68, r); $display("CRTO = %h", r);
+    if (r != {16'd20, 16'd20}) fail("CRTO");
     mmio_read32(32'h8, r);  $display("VS     = %h", r);
     if (r != 32'h0002_0400) fail("VS");
 
@@ -576,6 +578,13 @@ module tb_top #(
     if (st != 0) fail("Identify NS status");
     if (hr64(idbuf + 64'h2000) != NSZE) fail($sformatf("Identify NSZE %0d", hr64(idbuf + 64'h2000)));
     if (hr32(idbuf + 64'h2000 + 128) != 32'h000C_0000) fail("Identify LBAF0");
+
+    // ---- Identify CNS 08h (I/O command set independent NS): NSTAT.NRDY ----
+    c = new_cmd(8'h06, 32'd1);
+    c[6] = idbuf[31:0] + 32'h7000; c[7] = 0; c[10] = 32'h8;
+    run_cmd(0, c, dw0, st);
+    if (st != 0) fail("Identify CNS 08h status");
+    if (hr8(idbuf + 64'h7000 + 14) != 8'h01) fail("Identify CNS 08h NSTAT.NRDY");
 
     // ---- Identify CNS 06h (I/O command set specific): zeros, success ----
     c = new_cmd(8'h06, 32'd0);
