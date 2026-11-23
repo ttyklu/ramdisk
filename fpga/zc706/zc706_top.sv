@@ -5,7 +5,7 @@
 //                           nvme_top (REC_LOG2: 128 KB records by default)
 //                              |  AXI4 64-bit @ 125 MHz
 //                           axi_cc (clock converter, async) -> ui_clk 200 MHz
-//                           axi_dw (64 -> 512 bits)
+//                           axi_dw (64 -> 512 bits), axi_rs (register slice)
 //                           ddr    (MIG 7 series, PL DDR3 SODIMM, 1 GB)
 //
 // LEDs: 0 = PCIe link up, 1 = DDR3 calibrated, 2 = user_clk heartbeat, 3 = DMA error (sticky)
@@ -227,6 +227,25 @@ module zc706_top #(
     .m_axi_rready(d_rready)
   );
 
+  // register slice output (512-bit) -> MIG
+  logic [31:0]  r_awaddr, r_araddr;
+  logic [7:0]   r_awlen, r_arlen;
+  logic [2:0]   r_awsize, r_arsize, r_awprot, r_arprot;
+  logic [1:0]   r_awburst, r_arburst, r_bresp, r_rresp;
+  logic [0:0]   r_awlock, r_arlock;
+  logic [3:0]   r_awcache, r_arcache, r_awregion, r_arregion, r_awqos, r_arqos;
+  logic         r_awvalid, r_awready, r_wlast, r_wvalid, r_wready, r_bvalid, r_bready;
+  logic         r_arvalid, r_arready, r_rlast, r_rvalid, r_rready;
+  logic [511:0] r_wdata, r_rdata;
+  logic [63:0]  r_wstrb;
+
+  // register slice between the width converter and the MIG (timing margin at 200 MHz)
+  axi_rs u_axi_rs (
+    .aclk(ui_clk), .aresetn(ui_aresetn),
+    .s_axi_awaddr(d_awaddr), .s_axi_awlen(d_awlen), .s_axi_awsize(d_awsize), .s_axi_awburst(d_awburst), .s_axi_awlock(d_awlock), .s_axi_awcache(d_awcache), .s_axi_awprot(d_awprot), .s_axi_awregion(d_awregion), .s_axi_awqos(d_awqos), .s_axi_awvalid(d_awvalid), .s_axi_awready(d_awready), .s_axi_wdata(d_wdata), .s_axi_wstrb(d_wstrb), .s_axi_wlast(d_wlast), .s_axi_wvalid(d_wvalid), .s_axi_wready(d_wready), .s_axi_bresp(d_bresp), .s_axi_bvalid(d_bvalid), .s_axi_bready(d_bready), .s_axi_araddr(d_araddr), .s_axi_arlen(d_arlen), .s_axi_arsize(d_arsize), .s_axi_arburst(d_arburst), .s_axi_arlock(d_arlock), .s_axi_arcache(d_arcache), .s_axi_arprot(d_arprot), .s_axi_arregion(d_arregion), .s_axi_arqos(d_arqos), .s_axi_arvalid(d_arvalid), .s_axi_arready(d_arready), .s_axi_rdata(d_rdata), .s_axi_rresp(d_rresp), .s_axi_rlast(d_rlast), .s_axi_rvalid(d_rvalid), .s_axi_rready(d_rready),
+    .m_axi_awaddr(r_awaddr), .m_axi_awlen(r_awlen), .m_axi_awsize(r_awsize), .m_axi_awburst(r_awburst), .m_axi_awlock(r_awlock), .m_axi_awcache(r_awcache), .m_axi_awprot(r_awprot), .m_axi_awregion(r_awregion), .m_axi_awqos(r_awqos), .m_axi_awvalid(r_awvalid), .m_axi_awready(r_awready), .m_axi_wdata(r_wdata), .m_axi_wstrb(r_wstrb), .m_axi_wlast(r_wlast), .m_axi_wvalid(r_wvalid), .m_axi_wready(r_wready), .m_axi_bresp(r_bresp), .m_axi_bvalid(r_bvalid), .m_axi_bready(r_bready), .m_axi_araddr(r_araddr), .m_axi_arlen(r_arlen), .m_axi_arsize(r_arsize), .m_axi_arburst(r_arburst), .m_axi_arlock(r_arlock), .m_axi_arcache(r_arcache), .m_axi_arprot(r_arprot), .m_axi_arregion(r_arregion), .m_axi_arqos(r_arqos), .m_axi_arvalid(r_arvalid), .m_axi_arready(r_arready), .m_axi_rdata(r_rdata), .m_axi_rresp(r_rresp), .m_axi_rlast(r_rlast), .m_axi_rvalid(r_rvalid), .m_axi_rready(r_rready)
+  );
+
   ddr u_ddr (
     .ddr3_dq, .ddr3_dqs_n, .ddr3_dqs_p, .ddr3_addr, .ddr3_ba, .ddr3_ras_n, .ddr3_cas_n, .ddr3_we_n,
     .ddr3_reset_n, .ddr3_ck_p, .ddr3_ck_n, .ddr3_cke, .ddr3_cs_n, .ddr3_dm, .ddr3_odt,
@@ -235,17 +254,17 @@ module zc706_top #(
     .ui_addn_clk_3(), .ui_addn_clk_4(), .mmcm_locked(mmcm_locked), .aresetn(ui_aresetn),
     .app_sr_req(1'b0), .app_ref_req(1'b0), .app_zq_req(1'b0),
     .app_sr_active(), .app_ref_ack(), .app_zq_ack(),
-    .s_axi_awid(2'b00), .s_axi_awaddr(d_awaddr), .s_axi_awlen(d_awlen), .s_axi_awsize(d_awsize),
-    .s_axi_awburst(d_awburst), .s_axi_awlock(d_awlock), .s_axi_awcache(d_awcache), .s_axi_awprot(d_awprot),
-    .s_axi_awqos(d_awqos), .s_axi_awvalid(d_awvalid), .s_axi_awready(d_awready),
-    .s_axi_wdata(d_wdata), .s_axi_wstrb(d_wstrb), .s_axi_wlast(d_wlast), .s_axi_wvalid(d_wvalid),
-    .s_axi_wready(d_wready), .s_axi_bready(d_bready), .s_axi_bid(), .s_axi_bresp(d_bresp),
-    .s_axi_bvalid(d_bvalid),
-    .s_axi_arid(2'b00), .s_axi_araddr(d_araddr), .s_axi_arlen(d_arlen), .s_axi_arsize(d_arsize),
-    .s_axi_arburst(d_arburst), .s_axi_arlock(d_arlock), .s_axi_arcache(d_arcache), .s_axi_arprot(d_arprot),
-    .s_axi_arqos(d_arqos), .s_axi_arvalid(d_arvalid), .s_axi_arready(d_arready),
-    .s_axi_rready(d_rready), .s_axi_rid(), .s_axi_rdata(d_rdata), .s_axi_rresp(d_rresp),
-    .s_axi_rlast(d_rlast), .s_axi_rvalid(d_rvalid),
+    .s_axi_awid(2'b00), .s_axi_awaddr(r_awaddr), .s_axi_awlen(r_awlen), .s_axi_awsize(r_awsize),
+    .s_axi_awburst(r_awburst), .s_axi_awlock(r_awlock), .s_axi_awcache(r_awcache), .s_axi_awprot(r_awprot),
+    .s_axi_awqos(r_awqos), .s_axi_awvalid(r_awvalid), .s_axi_awready(r_awready),
+    .s_axi_wdata(r_wdata), .s_axi_wstrb(r_wstrb), .s_axi_wlast(r_wlast), .s_axi_wvalid(r_wvalid),
+    .s_axi_wready(r_wready), .s_axi_bready(r_bready), .s_axi_bid(), .s_axi_bresp(r_bresp),
+    .s_axi_bvalid(r_bvalid),
+    .s_axi_arid(2'b00), .s_axi_araddr(r_araddr), .s_axi_arlen(r_arlen), .s_axi_arsize(r_arsize),
+    .s_axi_arburst(r_arburst), .s_axi_arlock(r_arlock), .s_axi_arcache(r_arcache), .s_axi_arprot(r_arprot),
+    .s_axi_arqos(r_arqos), .s_axi_arvalid(r_arvalid), .s_axi_arready(r_arready),
+    .s_axi_rready(r_rready), .s_axi_rid(), .s_axi_rdata(r_rdata), .s_axi_rresp(r_rresp),
+    .s_axi_rlast(r_rlast), .s_axi_rvalid(r_rvalid),
     .init_calib_complete(calib_done), .device_temp(),
     .sys_rst(cpu_reset)
   );

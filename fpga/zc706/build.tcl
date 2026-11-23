@@ -12,7 +12,7 @@ create_project -in_memory -part xc7z045ffg900-2
 set_property board_part xilinx.com:zc706:part0:1.5 [current_project]
 set_param general.maxThreads 8
 
-foreach ip {pcie ddr axi_cc axi_dw} { read_ip [file join $here ip $ip $ip.xci] }
+foreach ip {pcie ddr axi_cc axi_dw axi_rs} { read_ip [file join $here ip $ip $ip.xci] }
 # out-of-context IP synthesis (checkpoints are cached next to the .xci)
 foreach ip [get_ips] {
   generate_target {synthesis instantiation_template} $ip

@@ -6,6 +6,7 @@
 #  * ddr    : MIG 7 series, PL DDR3 SODIMM from the ZC706 board preset (AXI4 512-bit, ui_clk 200 MHz)
 #  * axi_cc : AXI clock converter, 64-bit, user_clk (125 MHz) -> ui_clk (200 MHz)
 #  * axi_dw : AXI data width converter, 64 -> 512 bits at ui_clk
+#  * axi_rs : AXI register slice, 512-bit, all channels registered (timing margin into the MIG)
 set here [file dirname [file normalize [info script]]]
 set board_dir /home/guangming/Xilinx/2026.1/Vivado/data/xhub/boards/XilinxBoardStore/boards/Xilinx/zc706/1.5
 set prj [expr {[llength $argv] > 0 ? [file normalize [lindex $argv 0]] : "$board_dir/mig.prj"}]
@@ -55,7 +56,12 @@ create_ip -name axi_dwidth_converter -vendor xilinx.com -library ip -module_name
 set_property -dict [list CONFIG.PROTOCOL {AXI4} CONFIG.SI_DATA_WIDTH {64} CONFIG.MI_DATA_WIDTH {512} \
   CONFIG.ADDR_WIDTH {32} CONFIG.SI_ID_WIDTH {0}] [get_ips axi_dw]
 
-foreach ip {pcie ddr axi_cc axi_dw} {
+create_ip -name axi_register_slice -vendor xilinx.com -library ip -module_name axi_rs -dir $ipdir
+set_property -dict [list CONFIG.PROTOCOL {AXI4} CONFIG.DATA_WIDTH {512} CONFIG.ADDR_WIDTH {32} \
+  CONFIG.ID_WIDTH {0} CONFIG.REG_AW {1} CONFIG.REG_AR {1} CONFIG.REG_W {1} CONFIG.REG_R {1} CONFIG.REG_B {1}] \
+  [get_ips axi_rs]
+
+foreach ip {pcie ddr axi_cc axi_dw axi_rs} {
   generate_target {instantiation_template synthesis} [get_ips $ip]
   puts "GEN $ip done"
 }
