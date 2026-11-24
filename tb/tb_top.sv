@@ -21,6 +21,7 @@ module tb_top #(
   localparam bit [31:0]   BAR0     = 32'hF000_0000;
   localparam bit [63:0]   MSI_ADDR = 64'h0000_0000_FEE0_0000;
   localparam int          N_IO     = 80;
+  localparam int          CPL_TO   = 20000;  // DMA read completion timeout in the DUT (cycles)
 
   // ---------------- clock / reset ----------------
   logic clk = 1'b0;
@@ -35,7 +36,7 @@ module tb_top #(
   logic [63:0] wdata, rdata; logic [7:0] wstrb; logic [1:0] bresp, rresp;
   logic dma_err;
 
-  nvme_top #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .REC_LOG2(REC_LOG2), .PAYLOAD_BSWAP(BSWAP)) dut (
+  nvme_top #(.NQ(NQ), .NV(NV), .NSZE(NSZE), .REC_LOG2(REC_LOG2), .PAYLOAD_BSWAP(BSWAP), .CPL_TO(CPL_TO)) dut (
     .clk, .rst,
     .rx_tdata, .rx_tvalid, .rx_tready, .rx_tuser,
     .tx_tdata, .tx_tkeep, .tx_tlast, .tx_tvalid, .tx_tready, .tx_tuser,
@@ -237,6 +238,7 @@ module tb_top #(
   int        pend_rem[$];      // bytes
   bit [15:0] pend_rid[$];
   bit        tag_busy [256];
+  bit        drop_mrd = 1'b0;  // host stops answering device reads (lost completions)
 
   function automatic void handle_tx_tlp();
     bit [31:0] dw[$];
@@ -282,6 +284,7 @@ module tb_top #(
         bit [7:0] tag;
         tag = h1[15:8];
         n_mrd++;
+        if (drop_mrd) return;
         if (len > 32) fail($sformatf("MRd length %0d > 32 DW", len));
         if ((addr & 64'h7F) + len * 4 > 128) fail($sformatf("MRd crosses 128 B: addr=%h len=%0d", addr, len));
         if (tag_busy[tag]) fail($sformatf("MRd tag %0d reused while outstanding", tag));
@@ -505,6 +508,52 @@ module tb_top #(
     end
   endtask
 
+  // ---------------- controller reset / bring-up ----------------
+  // CC.EN = 0, then RDY must clear within max_cycles (well under CAP.TO)
+  task automatic disable_ctrl(input string what, input int max_cycles);
+    bit [31:0] r;
+    int        t0;
+    t0 = 0;
+    mmio_write32(32'h14, 32'h0046_0000);
+    r = 1;
+    while (r[0] && t0 < max_cycles) begin
+      repeat (50) @(posedge clk);
+      t0 += 50;
+      mmio_read32(32'h1C, r);
+    end
+    if (r[0]) fail($sformatf("%s: CSTS.RDY did not clear in %0d cycles", what, max_cycles));
+    else      $display("[%0t] %s: CSTS.RDY cleared after ~%0d cycles", $time, what, t0);
+  endtask
+
+  // enable with the admin queue at the same place, then create I/O queue pair 1
+  task automatic bring_up();
+    bit [31:0] r, dw0;
+    bit [14:0] st;
+    sqe_t      c;
+    for (int q = 0; q <= NQ; q++) begin sq_tail[q] = 0; cq_head[q] = 0; cq_ph[q] = 1; end
+    for (int i = 0; i < 64; i++) begin
+      hw32(cq_base[0] + 64'(i * 16 + 12), 32'd0);   // stale CQEs carry phase 1
+      hw32(cq_base[1] + 64'(i * 16 + 12), 32'd0);
+    end
+    mmio_write32(32'h24, {4'd0, 12'(cq_size[0] - 1), 4'd0, 12'(sq_size[0] - 1)});
+    mmio_write64(32'h28, sq_base[0]);
+    mmio_write64(32'h30, cq_base[0]);
+    mmio_write32(32'h14, 32'h0046_0001);
+    r = 0;
+    for (int i = 0; i < 100 && !r[0]; i++) mmio_read32(32'h1C, r);
+    if (!r[0]) fail("bring-up: CSTS.RDY did not set");
+    c = new_cmd(8'h05, 32'd0);
+    c[6] = cq_base[1][31:0]; c[7] = cq_base[1][63:32];
+    c[10] = {16'(cq_size[1] - 1), 16'd1}; c[11] = {16'd1, 14'd0, 1'b1, 1'b1};
+    run_cmd(0, c, dw0, st);
+    if (st != 0) fail($sformatf("bring-up: Create CQ status %h", st));
+    c = new_cmd(8'h01, 32'd0);
+    c[6] = sq_base[1][31:0]; c[7] = sq_base[1][63:32];
+    c[10] = {16'(sq_size[1] - 1), 16'd1}; c[11] = {16'd1, 15'd0, 1'b1};
+    run_cmd(0, c, dw0, st);
+    if (st != 0) fail($sformatf("bring-up: Create SQ status %h", st));
+  endtask
+
   // ---------------- main sequence ----------------
   initial begin
     bit [31:0] r, dw0;
@@ -693,8 +742,45 @@ module tb_top #(
     r = 1;
     for (int i = 0; i < 100 && r[0]; i++) mmio_read32(32'h1C, r);
     if (r[0]) fail("CSTS.RDY did not clear");
-
     if (dma_err) fail("dma_err set");
+
+    // ---- CC.EN 1 -> 0 with I/O queues live and a command in flight ----
+    // (what Linux sees after the UEFI NVMe driver left the controller enabled)
+    bring_up();
+    do_write(1, 64'd300, 4, 0);
+    begin
+      bit [63:0] p1, p2;
+      build_prp(64'h0000_0000_2000_0000, 32 * 4096, 0, p1, p2);
+      c = new_cmd(8'h01, 32'd1);
+      c[6] = p1[31:0]; c[7] = p1[63:32]; c[8] = p2[31:0]; c[9] = p2[63:32];
+      c[10] = 32'd320; c[12] = 32'd31;
+      submit(1, c, cid);
+    end
+    repeat (300) @(posedge clk);
+    disable_ctrl("disable with a write in flight", 50000);
+    mmio_read32(32'hF00, r);
+    if (r[5:0] != 6'd0 || !r[8] || !r[9]) fail($sformatf("debug reg after disable %h", r));
+    bring_up();
+    do_read(1, 64'd300, 4, 0);
+    if (dma_err) fail("dma_err set after in-flight disable");
+
+    // ---- CC.EN 1 -> 0 while the host has stopped answering reads ----
+    disable_ctrl("disable after reset test", 50000);
+    bring_up();
+    drop_mrd = 1'b1;
+    c = new_cmd(8'h02, 32'd1); c[6] = 32'h2000_0000; c[12] = 32'd0;
+    submit(1, c, cid);                      // the SQE fetch is never answered
+    repeat (2000) @(posedge clk);
+    mmio_read32(32'hF00, r);
+    if (r[8]) fail($sformatf("dma_rd idle with a dropped read outstanding (dbg %h)", r));
+    disable_ctrl("disable with lost completions", 4 * CPL_TO);
+    mmio_read32(32'hF00, r);
+    if (!r[15] || !r[14]) fail($sformatf("completion timeout not flagged (dbg %h)", r));
+    drop_mrd = 1'b0;
+    bring_up();
+    do_write(1, 64'd400, 3, 8);
+    do_read (1, 64'd400, 3, 0);
+    disable_ctrl("final disable", 50000);
     $display("MRd TLPs: %0d  MWr TLPs: %0d  MSI-X per vector: %0d %0d %0d",
              n_mrd, n_mwr, msi_cnt[0], msi_cnt[1], msi_cnt[2]);
     $display("DDR bursts: %0d AW, %0d W, %0d B", u_ddr.n_aw, u_ddr.n_w, u_ddr.n_b);

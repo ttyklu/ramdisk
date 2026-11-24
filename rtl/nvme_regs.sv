@@ -3,6 +3,8 @@
 //   0x1000  doorbells (DSTRD = 0): SQyTDBL at 0x1000 + 8y, CQyHDBL at 0x1004 + 8y
 //   0x2000  MSI-X table (16 B per vector)
 //   0x3000  MSI-X PBA
+//   0x0F00  vendor debug (read only): {dma_rd flags, engine idle/busy flags, FSM state}
+//   0x0F04  vendor debug: CC as seen by the controller core, DMA ring fill
 // Handles one completer request at a time; register reads produce a completion on the C port.
 module nvme_regs import nvme_pkg::*; #(
   parameter int NQ = 4,                  // I/O queue pairs (queue IDs 1..NQ)
@@ -55,7 +57,8 @@ module nvme_regs import nvme_pkg::*; #(
   output logic [NV*64-1:0] msix_addr,
   output logic [NV*32-1:0] msix_data,
   output logic [NV-1:0]    msix_mask,
-  input  logic [NV-1:0]    msix_pba
+  input  logic [NV-1:0]    msix_pba,
+  input  logic [63:0]      dbg
 );
 
   localparam int Q = NQ + 1;
@@ -97,6 +100,8 @@ module nvme_regs import nvme_pkg::*; #(
         12'h00C: r = acq[31:0];
         12'h00D: r = acq[63:32];
         12'h01A: r = CRTO;
+        12'h3C0: r = dbg[31:0];
+        12'h3C1: r = dbg[63:32];
         default: r = 32'd0;
       endcase
     end else if (a >= 12'h800 && a < 12'h800 + 4*NV) begin

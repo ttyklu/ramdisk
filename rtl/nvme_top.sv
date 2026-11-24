@@ -13,7 +13,8 @@ module nvme_top #(
   parameter logic [63:0] NSZE          = 64'((1024 - RING_MB) * 256),   // 1 GB minus the ring, 4 KB blocks
   parameter logic [31:0] DDR_BASE      = 32'h0000_0000,
   parameter int          REC_LOG2      = 17,                // largest record: 17 = 128 KB ... 20 = 1 MB
-  parameter bit          PAYLOAD_BSWAP = 1'b0
+  parameter bit          PAYLOAD_BSWAP = 1'b0,
+  parameter int          CPL_TO        = 1 << 22            // DMA read completion timeout, clk cycles
 )(
   input  logic        clk,          // pcie_7x user_clk_out
   input  logic        rst,          // pcie_7x user_reset_out (active high)
@@ -165,6 +166,9 @@ module nvme_top #(
   logic [NV*64-1:0] msix_addr;
   logic [NV*32-1:0] msix_data;
   logic [NV-1:0]    msix_mask, msix_pba;
+  logic [63:0]      dbg;
+  logic [5:0]       dbg_st;
+  logic             drd_cto;
 
   nvme_regs #(.NQ(NQ), .NV(NV)) u_regs (
     .clk, .rst,
@@ -173,7 +177,7 @@ module nvme_top #(
     .c_valid, .c_ready, .c_rid, .c_tag, .c_tc, .c_attr, .c_status, .c_la, .c_bc, .c_len, .c_d0, .c_d1,
     .cc, .aqa, .asq, .acq, .csts_rdy, .sq_tail_db, .cq_head_db,
     .db_clr, .db_clr_sq, .db_clr_q,
-    .msix_addr, .msix_data, .msix_mask, .msix_pba
+    .msix_addr, .msix_data, .msix_mask, .msix_pba, .dbg
   );
 
   // ---------------- dma_rd ----------------
@@ -187,14 +191,14 @@ module nvme_top #(
 
   assign drd_pop = data_to_ddr ? ddrw_pop : ctrl_drd_pop;
 
-  dma_rd #(.NT(16), .RAW(RAW)) u_drd (
+  dma_rd #(.NT(16), .RAW(RAW), .CTO(CPL_TO)) u_drd (
     .clk, .rst,
     .job_valid(drd_job_valid), .job_ready(drd_job_ready), .job_addr(drd_job_addr), .job_len(drd_job_len),
     .r_valid, .r_ready, .r_addr, .r_len, .r_tag,
     .cpl_hdr_valid, .cpl_tag, .cpl_la, .cpl_status, .cpl_len, .cpl_hasdata,
     .cpl_data_valid, .cpl_data_cnt, .cpl_dw0, .cpl_dw1,
     .avail(drd_avail), .head0(drd_head0), .head1(drd_head1), .pop(drd_pop),
-    .idle(drd_idle), .err(dma_err)
+    .idle(drd_idle), .err(dma_err), .cto(drd_cto)
   );
 
   // ---------------- TX FIFO ----------------
@@ -315,7 +319,17 @@ module nvme_top #(
     .xf_start, .xf_func, .xf_rd_addr, .xf_rd_len, .xf_skip, .xf_in_len, .xf_ck_len, .xf_dst_tx,
     .xf_wr_addr, .xf_out_lim, .xf_busy, .xf_done, .xf_out_len, .xf_wr_bytes, .xf_over,
     .xf_fi({xf_fid, xf_fic, xf_fib, xf_fia}), .xf_fo({xf_fod, xf_foc, xf_fob, xf_foa}),
-    .xf_adler, .xf_ierr, .xf_consumed
+    .xf_adler, .xf_ierr, .xf_consumed, .dbg_st
   );
+
+  // ---------------- debug register (BAR0 0xF00 / 0xF04) ----------------
+  //  F00: [5:0] FSM state  [8] drd_idle [9] mwr_idle [10] ddrr_busy [11] ddrw_busy
+  //       [12] xf_busy [13] data_to_ddr [14] dma_err [15] dma completion timeout seen
+  //       [16] CSTS.RDY [31:20] TX FIFO count
+  //  F04: [10:0] DMA ring DWs available  [16] CC.EN  [31:24] CC[23:16] (IOCQES/IOSQES)
+  assign dbg = {cc[23:16], 7'd0, cc[0], 5'd0, 11'(drd_avail),
+                12'(txf_count), 3'd0, csts_rdy,
+                drd_cto, dma_err, data_to_ddr, xf_busy, ddrw_busy, ddrr_busy, mwr_idle, drd_idle,
+                2'd0, dbg_st};
 
 endmodule

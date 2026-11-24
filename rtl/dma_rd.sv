@@ -7,9 +7,16 @@
 //    ring buffer at the position reserved for that request, and requests are committed
 //    in issue order once all their data has arrived.
 //  * The consumer pops 0..2 DWs per cycle while 'avail' > 0.
+//  * Completion timeout: if requests are outstanding and no completion arrives for CTO
+//    cycles, every outstanding request is released as failed (err set, its ring space
+//    committed with undefined data). Without this a lost completion (host reset, IOMMU
+//    or bus master change under a live controller) would leave the engine busy forever
+//    and the controller could never finish a CC.EN 1 -> 0 reset.
+//  * Completions for a tag that is not outstanding (late after a timeout) are dropped.
 module dma_rd #(
   parameter int NT  = 16,      // outstanding read tags (power of 2)
-  parameter int RAW = 10       // log2(ring size in DWs)
+  parameter int RAW = 10,      // log2(ring size in DWs)
+  parameter int CTO = 1 << 22  // completion timeout in clk cycles (~34 ms at 125 MHz)
 )(
   input  logic          clk,
   input  logic          rst,
@@ -41,7 +48,8 @@ module dma_rd #(
   output logic [31:0]   head1,
   input  logic [1:0]    pop,
   output logic          idle,
-  output logic          err             // sticky: a completion came back with an error status
+  output logic          err,            // sticky: a completion came back with an error status
+  output logic          cto             // sticky: a completion timeout released requests
 );
 
   localparam int TW = $clog2(NT);
@@ -65,7 +73,11 @@ module dma_rd #(
   wire [5:0]  nlen   = (cur_rem < {6'd0, to_bnd}) ? cur_rem[5:0] : to_bnd;
 
   assign job_ready = !active;
-  assign r_valid   = active && (outstanding < (TW+1)'(NT)) && (ring_free >= {{(RAW-5){1'b0}}, nlen});
+  localparam int CW = $clog2(CTO + 1);
+  logic [CW-1:0] cto_cnt;
+  wire           cto_hit = (cto_cnt == CW'(CTO));
+
+  assign r_valid   = active && !cto_hit && (outstanding < (TW+1)'(NT)) && (ring_free >= {{(RAW-5){1'b0}}, nlen});
   assign r_addr    = cur_addr;
   assign r_len     = {5'd0, nlen};
   assign r_tag     = {{(8-TW){1'b0}}, issue_cnt[TW-1:0]};
@@ -80,7 +92,10 @@ module dma_rd #(
   wire  [RAW-1:0] hidx   = req_base[htag] + {{(RAW-5){1'b0}}, hoff};
   wire  [RAW-1:0] widx   = cpl_hdr_valid ? hidx : cidx;
   wire  [TW-1:0]  wtag   = cpl_hdr_valid ? htag : ctag;
-  wire  [1:0]     wcnt   = cpl_data_valid ? cpl_data_cnt : 2'd0;
+  logic           cok;           // the current completion's tag was outstanding at its header
+  wire            hpend  = (req_rem[htag] != 6'd0);
+  wire            wok    = cpl_hdr_valid ? hpend : cok;
+  wire  [1:0]     wcnt   = (cpl_data_valid && wok) ? cpl_data_cnt : 2'd0;
 
   dw_ram2 #(.AW(RAW)) u_ring (
     .clk  (clk),
@@ -107,6 +122,9 @@ module dma_rd #(
       cidx       <= '0;
       ctag       <= '0;
       err        <= 1'b0;
+      cto        <= 1'b0;
+      cto_cnt    <= '0;
+      cok        <= 1'b0;
       for (int t = 0; t < NT; t++) req_rem[t] <= '0;
     end else begin
       // job accept
@@ -130,13 +148,13 @@ module dma_rd #(
       end
 
       // completion data
-      if (cpl_hdr_valid) ctag <= htag;
+      if (cpl_hdr_valid) begin ctag <= htag; cok <= hpend; end
       if (cpl_data_valid) begin
         cidx <= widx + {{(RAW-2){1'b0}}, cpl_data_cnt};
-        req_rem[wtag] <= req_rem[wtag] - {4'd0, cpl_data_cnt};
+        if (wok) req_rem[wtag] <= (req_rem[wtag] > {4'd0, cpl_data_cnt}) ? req_rem[wtag] - {4'd0, cpl_data_cnt} : 6'd0;
       end else if (cpl_hdr_valid) begin
         cidx <= hidx;
-        if (cpl_status != 3'b000) begin
+        if (cpl_status != 3'b000 && hpend) begin
           // unsuccessful completion: no data will come; release the request
           err           <= 1'b1;
           req_rem[htag] <= 6'd0;
@@ -150,6 +168,16 @@ module dma_rd #(
       end
 
       rd_ptr <= rd_ptr + {{(RAW-1){1'b0}}, pop};
+
+      // completion timeout: no completion for CTO cycles while requests are outstanding
+      if (outstanding == '0 || cpl_hdr_valid) cto_cnt <= '0;
+      else if (!cto_hit)                      cto_cnt <= cto_cnt + 1'b1;
+      if (cto_hit) begin
+        err     <= 1'b1;
+        cto     <= 1'b1;
+        cto_cnt <= '0;
+        for (int t = 0; t < NT; t++) req_rem[t] <= 6'd0;   // non-outstanding tags are 0 already
+      end
     end
   end
 

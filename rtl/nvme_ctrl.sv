@@ -98,7 +98,9 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
   input  logic [255:0]           xf_fo,
   input  logic [31:0]            xf_adler,
   input  logic [3:0]             xf_ierr,
-  input  logic [23:0]            xf_consumed
+  input  logic [23:0]            xf_consumed,
+
+  output logic [5:0]             dbg_st          // FSM state, for the debug register
 );
 
   localparam int Q  = NQ + 1;
@@ -1256,7 +1258,18 @@ module nvme_ctrl import nvme_pkg::*; import nvme_identify::*; #(
 
         default: st <= S_OFF;
       endcase
+
+      // CC.EN cleared while a command is between fetch and its data phase: drop it.
+      // No data engine, generator or xform has been started yet, and S_DISABLE drains
+      // whatever the SQ / PRP list fetch still returns. (Once the data phase has started
+      // the command runs to S_CQE_ROOM, which also goes to S_DISABLE; dma_rd's completion
+      // timeout bounds that even if the host stops answering reads.)
+      if (!cc[0] && (st == S_FETCH || st == S_FETCH_RD || st == S_DECODE || st == S_PRP ||
+                     st == S_PRPL_CALC || st == S_PRPL_FETCH || st == S_PRPL_RD))
+        st <= S_DISABLE;
     end
   end
+
+  assign dbg_st = 6'(st);
 
 endmodule
