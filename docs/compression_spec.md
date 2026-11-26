@@ -164,10 +164,32 @@ stream); with an LBA source its length is NLB blocks and the stream end marks CS
 4. Set CEN = 0 again to go back to RAW. A controller reset (CC.EN 1 -> 0) also returns to RAW and
    frees every slot.
 
-**MPTR and Linux.** 81h and 86h need MPTR, and the Linux `nvme` driver will not map a metadata
-buffer for a passthrough command on a namespace that has no metadata (the ioctl is refused).
-From Linux, either use the FFE commands (89h / 8Ah return the CRB in the data buffer and work
-through `NVME_IOCTL_IO_CMD`), or drive the controller from user space through VFIO, as
+### What works through the Linux nvme driver
+
+The vendor commands can be sent with the standard passthrough ioctl (`NVME_IOCTL_IO_CMD`, as
+`nvme io-passthru` does), with two host-side limits, both measured on Linux 7.0 with the IOMMU
+in DMA-FQ mode (`scripts/vs_passthru_check.py`, 2026-11-26):
+
+* **No metadata buffer.** A passthrough command with a metadata buffer on a namespace without
+  metadata fails with EINVAL in the kernel, so MPTR cannot be supplied. Without one the kernel
+  leaves MPTR at 0.
+* **128 KB per transfer.** nvme-pci caps `max_hw_sectors_kb` at the IOMMU's optimal mapping size,
+  128 KB, below the board's MDTS (256 KB). The other NVMe drive in the host has the same cap.
+  Larger commands fail with EINVAL before they reach the board.
+
+| Command | Through Linux | Notes |
+| --- | --- | --- |
+| 81h Compress-to-Staging | No | Needs MPTR for the Result Record |
+| 84h Commit | Yes | No data; vendor status codes (00Ch, 1C1h, ...) come back in the ioctl result |
+| 86h Decompress-Read | Only with NOCHK = 1 | Verified up to a full 128 KB record (ULEN = 128 KB fits). With NOCHK = 0 the device would read the checksum from address 0: do not send |
+| 89h FFE-Send 82h | Records up to 124 KB | 256 B of descriptors + the record must fit 128 KB |
+| 89h FFE-Send 83h | Yes | Inline stream or LBA source |
+| 8Ah FFE-Receive | Up to 128 KB - 64 B of output | The 64 B CRB comes first |
+
+So with stock Linux and an IOMMU, a 128 KB ZFS record has no complete compress path: 81h needs
+MPTR and FFE-Send needs 256 B more than the host allows. Decompress of a 128 KB record works
+with 86h and NOCHK (FFE-Receive cannot return it: CRB + 128 KB is over the limit). For full
+128 KB records drive the controller from user space through VFIO, as
 `scripts/staging_hwtest.py` does.
 
 ## Testing on hardware
@@ -176,6 +198,11 @@ through `NVME_IOCTL_IO_CMD`), or drive the controller from user space through VF
 | --- | --- | --- |
 | `scripts/ffe_hwtest.py` | FFE-Send / FFE-Receive: 82h compress, 83h decompress (inline and LBA source / destination), software zlib streams at levels 0, 1, 6, 9, error codes, rates | Linux `nvme` driver, passthrough ioctls on `/dev/nvme1` |
 | `scripts/staging_hwtest.py` | 81h, 84h, 86h: the two-phase write and Decompress-Read | `vfio-pci`, polled user-space NVMe driver |
+| `scripts/vs_passthru_check.py` | Which vendor commands the Linux driver passes: 84h status codes, 81h with a metadata buffer, 86h with NOCHK (FFE-written extents, software zlib 128 KB records, error codes) | Linux `nvme` driver, passthrough ioctls |
+
+`ffe_hwtest.py` and `vs_passthru_check.py` read `max_hw_sectors_kb` and shrink their largest
+record to fit (124 KB on a 128 KB host). Results on 2026-11-26: `ffe_hwtest.py` 245 of 245
+checks, `vs_passthru_check.py` 20 of 20.
 
 ```bash
 sudo python3 scripts/staging_hwtest.py              # finds the 10ee board; or pass 0000:08:00.0

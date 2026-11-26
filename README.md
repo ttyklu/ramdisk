@@ -85,6 +85,8 @@ are pipelined.
 | `scripts/pcie_check.py` | Hardware: full-namespace write / read-back / compare through the Linux block device |
 | `scripts/ffe_hwtest.py` | Hardware: FFE-Send / FFE-Receive compress and decompress through Linux NVMe passthrough |
 | `scripts/staging_hwtest.py` | Hardware: two-phase write (81h + 84h) and Decompress-Read (86h) through VFIO |
+| `scripts/vs_passthru_check.py` | Hardware: which compression vendor commands work through the Linux `nvme` passthrough ioctl |
+| `scripts/md2html.py` | Renders `README.md` and `docs/compression_spec.md` to HTML |
 
 ## Running the simulation
 
@@ -160,6 +162,7 @@ from a `!` command in Claude Code). Run them in a normal terminal.
 | `sudo python3 scripts/pcie_check.py [/dev/nvme1n1] [--mib N]` | O_DIRECT sequential write of a seeded pattern in 1 MiB I/Os, timed read-back with byte compare, then 4000 random-offset, random-size (4-256 KB) round-trips. Compares PCI status / DevSta / LnkSta and the kernel log before and after | Whole namespace, or the first N MiB |
 | `sudo python3 scripts/ffe_hwtest.py [/dev/nvme1]` | FFE-Send / FFE-Receive (82h compress, 83h decompress) against Python zlib, LBA destination and source, error codes, rates | LBAs >= 200000 |
 | `sudo python3 scripts/staging_hwtest.py [0000:08:00.0]` | Two-phase write and Decompress-Read; see [docs/compression_spec.md](docs/compression_spec.md#testing-on-hardware) | LBAs >= 200000 |
+| `sudo python3 scripts/vs_passthru_check.py [/dev/nvme1]` | Vendor commands through the Linux driver; see [docs/compression_spec.md](docs/compression_spec.md#what-works-through-the-linux-nvme-driver) | LBAs >= 230000 |
 
 Each prints `PASS` or `FAIL` at the end and exits non-zero on failure.
 
@@ -172,6 +175,9 @@ Results on 2026-11-26 (host: Intel root port 8086:7a30, Linux 7.0.0-44):
 | Sequential write, QD1, 1 MiB | 304 MiB/s (includes generating the pattern in Python) |
 | Sequential read, QD1, 1 MiB | 701 MiB/s |
 | `staging_hwtest.py` | PASS: 349 of 349 checks |
+| `ffe_hwtest.py` | PASS: 245 of 245 checks (largest record 124 KB, see below) |
+| `vs_passthru_check.py` | PASS: 20 of 20 checks; 81h refused by the kernel (EINVAL), as expected |
+| FFE compress / decompress, 124 KB text | 38.2 / 26.0 MB/s (FFE-Send + FFE-Receive, Python ioctl) |
 | Stage + commit, 128 KB text | 50.5 MB/s (2.6 ms per record, one command at a time, polled from Python) |
 | Decompress-Read, 128 KB text | 31.1 MB/s (4.2 ms per record) |
 
@@ -202,10 +208,13 @@ interconnect to the MIG DDR3 SODIMM controller.
 - Compression uses fixed Huffman codes only: text compresses to about 29% (zlib level 6: 12%).
   On the board the test's word-list text gives 33% (zlib level 6: 15%), and 128 KB of zeros
   gives 1280 bytes (zlib: 149). A dynamic-Huffman encoder is the next ratio step.
-- Compress-to-Staging (81h) and Decompress-Read (86h) use MPTR. The Linux `nvme` driver does not
-  pass a metadata buffer on a namespace without metadata, so they can only be sent from a
-  user-space driver (VFIO, SPDK) or a kernel module. FFE-Send / FFE-Receive work through the
-  standard passthrough ioctls.
+- Compress-to-Staging (81h) and Decompress-Read (86h) use MPTR. The Linux `nvme` driver refuses a
+  passthrough metadata buffer on a namespace without metadata (EINVAL), so 81h can only be sent
+  from a user-space driver (VFIO, SPDK) or a kernel module; 86h works through Linux with NOCHK.
+- With an IOMMU in DMA / DMA-FQ mode, Linux caps NVMe transfers at 128 KB (`max_hw_sectors_kb`),
+  below MDTS. FFE-Send of a 128 KB record needs 128 KB + 256 B and is refused, so through Linux
+  FFE records top out at 124 KB. With stock Linux there is no complete compress path for
+  128 KB records. See [docs/compression_spec.md](docs/compression_spec.md#what-works-through-the-linux-nvme-driver).
 - Two correctable Receiver Errors (physical layer) are logged at the upstream root port when the
   link retrains after a function reset, for example when the board moves between `vfio-pci` and
   `nvme`. None were seen during data transfers.

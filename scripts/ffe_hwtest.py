@@ -55,6 +55,10 @@ class Dev:
         self.cfd = os.open(ctrl, os.O_RDWR)
         self.nsdev = ctrl + "n1"
         self.nfd = os.open(self.nsdev, os.O_RDWR)
+        # largest passthrough transfer the host allows: nvme-pci caps it at the IOMMU's optimal
+        # mapping size (128 KB with an IOMMU in DMA / DMA-FQ mode), below the board's MDTS
+        q = f"/sys/block/{os.path.basename(self.nsdev)}/queue/max_hw_sectors_kb"
+        self.maxx = int(open(q).read()) * 1024
 
     def cmd(self, io, opc, nsid=0, cdw2=0, addr=0, dlen=0, cdw=(0, 0, 0, 0, 0, 0), timeout_ms=10000):
         c = bytearray(PT.pack(opc, 0, 0, nsid, cdw2, 0, 0, addr, 0, dlen, *cdw, timeout_ms, 0))
@@ -99,6 +103,7 @@ class Dev:
                         cdw=(plen, (2 << 16) | 2, 0 if lba_src else len(pay), 0, 0, 0))
 
     def ffe_recv(self, lid, n):
+        n = min(n, self.maxx)
         b = Buf(n)
         b.put(b"\x5a" * n)
         st, got = self.cmd(True, OPC_FRECV, nsid=1, cdw2=lid, addr=b.addr, dlen=n, cdw=(n, 0, 0, 0, 0, 0))
@@ -186,14 +191,21 @@ def main():
     st = d.set_c0(1, 0)
     if not t.check(st == 0, f"enable compression: {stname(st)}"):
         return 1
-    print("compression enabled (CEN=1, 128 KB records)\n")
+    print("compression enabled (CEN=1, 128 KB records)")
+    # FFE-Send carries 256 B of descriptors before the record; FFE-Receive returns the 64 B CRB
+    # before the data. Both must fit the host's largest transfer.
+    RT = REC if 256 + REC <= d.maxx else d.maxx - 4096
+    if RT != REC:
+        print(f"host transfer limit {d.maxx // 1024} KB (max_hw_sectors_kb): largest FFE record "
+              f"tested is {RT // 1024} KB, not {REC // 1024} KB")
+    print()
 
     try:
         # ---- 82h retained + 83h inline, against Python zlib ----
         print(f"{'record':>8} {'bytes':>7} {'csize':>7} {'psize':>7} {'ratio':>6}  sw zlib-6  result")
         keep_ext = None
         for kind in ("zeros", "text", "runs", "random"):
-            for n in (512, 4096, 13824, 65536, REC):
+            for n in (512, 4096, 13824, 65536, RT):
                 rec = gen(kind, n, rnd)
                 lid += 1
                 bad0 = t.bad
@@ -228,7 +240,7 @@ def main():
                         st, got, o2 = d.ffe_recv(lid, 64 + n)
                         t.check(st == 0 and got == 64 + n and o2[64:64 + n] == rec,
                                 f"{kind}/{n}: 83h round trip st={stname(st)} got={got}")
-                    if kind == "runs" and n == REC:
+                    if kind == "runs" and n == RT:
                         keep_ext = (rec, stored, r)
                 sw6 = len(zlib.compress(rec, 6))
                 print(f"{kind:>8} {n:>7} {r['csize']:>7} {r['psize']:>7} {n / r['csize']:>5.2f}x {sw6:>9}  "
@@ -237,11 +249,11 @@ def main():
         # ---- software zlib streams through 83h ----
         print("\nsoftware zlib streams -> 83h:")
         for kind in ("text", "runs", "random"):
-            rec = gen(kind, REC, rnd)
+            rec = gen(kind, RT, rnd)
             for lvl in (0, 1, 6, 9):
                 u = rec if lvl else rec[:65536]   # inline stream must fit a record: stored blocks at 64 KB
                 z = zlib.compress(u, lvl)
-                if len(z) > REC:
+                if len(z) > RT:
                     continue
                 lid += 1
                 st, _ = d.ffe_send(lid, 0x83, z)
@@ -268,8 +280,8 @@ def main():
             st, _ = d.ffe_send(lid, 0x83, src_lba=(TEST_LBA, nlb))
             ok = st == 0
             if ok:
-                st, got, o = d.ffe_recv(lid, 64 + REC)
-                ok = st == 0 and o[64:64 + REC] == rec
+                st, got, o = d.ffe_recv(lid, 64 + RT)
+                ok = st == 0 and o[64:64 + RT] == rec
             t.check(ok, f"83h from LBA source: st={stname(st)}")
             print(f"  {nlb} blocks at LBA {TEST_LBA}: write {'ok' if disk == stored else 'FAIL'}, "
                   f"decompress from LBA {'ok' if ok else 'FAIL'}")
@@ -289,13 +301,13 @@ def main():
         print(f"  unknown List ID -> {stname(st)}")
 
         # ---- rate ----
-        rec = gen("text", REC, rnd)
+        rec = gen("text", RT, rnd)
         N = 200
         t0 = time.perf_counter()
         for _ in range(N):
             lid = 0x200 + (lid + 1) % 0x100
             d.ffe_send(lid, 0x82, rec)
-            st, _, out = d.ffe_recv(lid, 64 + REC + 4096)
+            st, _, out = d.ffe_recv(lid, 64 + RT + 4096)
         t1 = time.perf_counter()
         cs = crb(out)["csize"]
         z = out[64:64 + cs]
@@ -303,18 +315,18 @@ def main():
         for _ in range(N):
             lid = 0x200 + (lid + 1) % 0x100
             d.ffe_send(lid, 0x83, z)
-            st, _, o = d.ffe_recv(lid, 64 + REC)
+            st, _, o = d.ffe_recv(lid, 64 + RT)
         t3 = time.perf_counter()
-        t.check(o[64:64 + REC] == rec, "rate loop: last decompress")
-        mb = N * REC / 1e6
-        print(f"\nrate, 128 KB text records, one at a time (FFE-Send + FFE-Receive, Python ioctl):")
+        t.check(o[64:64 + RT] == rec, "rate loop: last decompress")
+        mb = N * RT / 1e6
+        print(f"\nrate, {RT // 1024} KB text records, one at a time (FFE-Send + FFE-Receive, Python ioctl):")
         print(f"  compress   {mb / (t1 - t0):7.1f} MB/s  ({(t1 - t0) / N * 1e6:.0f} us/record)")
         print(f"  decompress {mb / (t3 - t2):7.1f} MB/s  ({(t3 - t2) / N * 1e6:.0f} us/record)")
         sw0 = time.perf_counter()
         for _ in range(20):
             zlib.compress(rec, 6)
         sw1 = time.perf_counter()
-        print(f"  (Python zlib level 6 on this CPU: {20 * REC / 1e6 / (sw1 - sw0):.1f} MB/s)")
+        print(f"  (Python zlib level 6 on this CPU: {20 * RT / 1e6 / (sw1 - sw0):.1f} MB/s)")
     finally:
         if not keep:
             st = d.set_c0(0)
