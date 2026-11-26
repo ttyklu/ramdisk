@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZC706 NVMe RAM Disk (with hardware compression)</title>
+<style>
+:root { --fg:#1f2328; --bg:#fff; --mute:#59636e; --line:#d1d9e0; --code:#f6f8fa; --link:#0969da; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --mute:#9198a1; --line:#3d444d; --code:#151b23; --link:#4493f8; }
+}
+html { background: var(--bg); color: var(--fg); }
+body { font: 15px/1.55 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+       max-width: 980px; margin: 0 auto; padding: 32px 24px 64px; }
+h1, h2, h3 { line-height: 1.25; margin: 1.6em 0 .6em; }
+h1 { font-size: 1.9em; border-bottom: 1px solid var(--line); padding-bottom: .3em; margin-top: 0; }
+h2 { font-size: 1.45em; border-bottom: 1px solid var(--line); padding-bottom: .25em; }
+h3 { font-size: 1.15em; }
+a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
+code, pre { font: 13px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+code { background: var(--code); padding: .15em .35em; border-radius: 4px; }
+pre { background: var(--code); padding: 14px 16px; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; margin: 1em 0; display: block; overflow-x: auto; }
+th, td { border: 1px solid var(--line); padding: 6px 12px; text-align: left; vertical-align: top; }
+th { background: var(--code); }
+td { font-variant-numeric: tabular-nums; }
+ul, ol { padding-left: 1.8em; } li { margin: .2em 0; }
+footer { color: var(--mute); font-size: 13px; margin-top: 48px; border-top: 1px solid var(--line); padding-top: 12px; }
+</style>
+</head>
+<body>
+<h1 id="zc706-nvme-ram-disk-with-hardware-compression">ZC706 NVMe RAM Disk (with hardware compression)</h1>
+<p>A hardware NVMe controller for the ZC706 that serves a namespace out of DDR3. No ARM firmware is involved: admin and I/O commands are handled entirely in the FPGA fabric. Hardware gzip (zlib) compression for ZFS runs through vendor commands: a streaming two-phase write (Compress-to-Staging, then Commit) and a single-phase Decompress-Read, plus a subset of the draft SNIA FFE-Send / FFE-Receive commands. The namespace is RAW by default. Interface: <a href="docs/compression_spec.html">docs/compression_spec.md</a>.</p>
+<p><strong>Status:</strong> the self-checking testbench passes in both Vivado xsim 2026.1 and Verilator 5.032, for 128 KB records (20/20 random seeds) and the optional 1 MB build. The deflate / inflate engines also pass 494 unit checks against Python's zlib. Out-of-context place and route on the ZC706 part (xc7z045ffg900-2) meets timing at 125 MHz for both builds (WNS +0.15 ns at 128 KB, +0.30 ns at 1 MB).</p>
+<p><strong>On hardware</strong> (ZC706, <code>fpga/zc706/</code>, DDR3-800): the board enumerates under the Linux 7.0 <code>nvme</code> driver as <code>nvme1n1</code> (960 MiB, 4 KB blocks) and trains at Gen2 x4. The whole namespace reads back byte-for-byte with no PCIe errors (<code>scripts/pcie_check.py</code>), and the two-phase compressed write, Decompress-Read and their error cases pass 349 of 349 checks (<code>scripts/staging_hwtest.py</code>). See <a href="#testing-on-the-board">Testing on the board</a>.</p>
+<h2 id="what-is-implemented">What is implemented</h2>
+<table><thead><tr><th>Area</th><th>Details</th></tr></thead><tbody><tr><td>PCIe</td><td>7 Series Integrated Block (<code>pcie_7x</code>) 128-bit AXI-Stream, Gen2 x4, 125 MHz <code>user_clk</code>; RX straddling handled (<code>rx128_to_64</code>, <code>tx64_to_128</code> adapt to the internal 64-bit TLP beats)</td></tr><tr><td>BAR0 (16 KB)</td><td>CAP / VS (2.4) / INTMS / INTMC / CC / CSTS / AQA / ASQ / ACQ, doorbells at 0x1000 (DSTRD = 0), MSI-X table at 0x2000, PBA at 0x3000</td></tr><tr><td>Queues</td><td>Admin + 4 I/O queue pairs (<code>NQ</code>), up to 4096 entries each, physically contiguous only</td></tr><tr><td>Admin commands</td><td>Identify (CNS 0, 1, 2; any other CNS returns 4 KB of zeros), Get Log Page (SMART has temperature/spare, others zero), Set/Get Features (Number of Queues answered, others accepted), Create/Delete I/O SQ/CQ, Abort, Asynchronous Event Request (held, never completed)</td></tr><tr><td>I/O commands</td><td>Read, Write, Flush. 4 KB LBAs, one namespace, MDTS = 128 KB (32 blocks)</td></tr><tr><td>PRPs</td><td>PRP1 at any DW offset, PRP2, PRP lists including chained list pages</td></tr><tr><td>DMA reads</td><td>Up to 16 outstanding MRd (128 B each, never crossing 128 B); completions may arrive out of order across tags</td></tr><tr><td>DMA writes</td><td>MWr up to 128 B, never crossing 128 B; 3DW headers below 4 GB, 4DW above</td></tr><tr><td>Interrupts</td><td>MSI-X, one message per completion, per-vector mask and pending bits</td></tr><tr><td>DDR</td><td>AXI4 master, 64-bit, 128 B INCR bursts; namespace starts at <code>DDR_BASE</code>, 64 MB staging ring after it</td></tr><tr><td>Compression</td><td>Set/Get Features C0h (CEN, record size; RAW default). Compress-to-Staging 81h, Commit 84h, Decompress-Read 86h, FFE-Send 89h (82h compress, 83h decompress), FFE-Receive 8Ah</td></tr><tr><td>Codec</td><td>zlib streams. Compress: LZ77 (32 KB window, 4096-entry hash) + fixed Huffman. Decompress: stored, fixed and dynamic blocks, Adler-32 checked</td></tr><tr><td>Checksums</td><td>ZFS Fletcher-4 of the stored bytes (zero padded to 4 KB), Adler-32 of the record</td></tr><tr><td>Records</td><td>128 KB (<code>REC_LOG2 = 17</code>, default) up to 1 MB (<code>REC_LOG2 = 20</code>); MDTS = 2 x record; 128 slots at 128 KB, 16 at 1 MB</td></tr><tr><td>BRAM</td><td>Estimated 45 RAMB36 of 545 (not yet synthesized): 64 KB x 2 deflate history, deflate hash table, 32 KB inflate history, slot records. Staging slots live in DDR</td></tr></tbody></table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>pcie_7x RX ─► tlp_rx ─┬─► nvme_regs (BAR0) ──► C port ─┐
+                      │      │ doorbells, CC, MSI-X    │
+                      │      ▼                          │
+                      │   nvme_ctrl (command FSM) ◄─────┼── arbitration, admin, PRP walk, CQE, MSI-X
+                      │      │ jobs                     │
+                      └─► dma_rd (tags + reorder ring) ─┼─► R port (MRd)
+                             │ DW stream                ▼
+                             ├─► SQE / PRP list      tlp_tx ─► pcie_7x TX
+                             └─► ddr_wr ─► AXI W        ▲
+                   AXI R ─► ddr_rd ─► TX DW FIFO ─► mwr_eng ─► W port (MWr)
+                     Identify / log / CQE / MSI data ─┘</code></pre>
+<p>One command is processed at a time. Within a command, DMA requests, DDR bursts and TLPs are pipelined.</p>
+<h2 id="files">Files</h2>
+<table><thead><tr><th>File</th><th>Purpose</th></tr></thead><tbody><tr><td><code>rtl/nvme_top.sv</code></td><td>Top level: pcie_7x AXI-Stream + cfg ports, AXI4 master to DDR</td></tr><tr><td><code>rtl/nvme_ctrl.sv</code></td><td>Command engine (enable/disable, arbitration, admin, I/O, PRP, CQE, MSI-X)</td></tr><tr><td><code>rtl/nvme_regs.sv</code></td><td>BAR0 registers, doorbells, MSI-X table/PBA, register-read completions</td></tr><tr><td><code>rtl/tlp_rx.sv</code>, <code>rtl/tlp_tx.sv</code></td><td>TLP parse / build for the 7-series 64-bit interface</td></tr><tr><td><code>rtl/dma_rd.sv</code></td><td>Host-memory reads with tag reorder ring</td></tr><tr><td><code>rtl/mwr_eng.sv</code></td><td>Splits host writes into MWr TLPs</td></tr><tr><td><code>rtl/ddr_rd.sv</code>, <code>rtl/ddr_wr.sv</code></td><td>AXI4 burst engines for the DDR</td></tr><tr><td><code>rtl/dw_fifo.sv</code>, <code>rtl/dw_ram2.sv</code></td><td>2-DW-per-cycle FIFO / RAM (LUTRAM)</td></tr><tr><td><code>rtl/xform.sv</code></td><td>DDR -&gt; COPY / DEFLATE / INFLATE -&gt; DDR or TX FIFO, with Fletcher-4 in and out</td></tr><tr><td><code>rtl/deflate_enc.sv</code>, <code>rtl/inflate.sv</code></td><td>zlib compressor (LZ77 + Huffman) and decompressor</td></tr><tr><td><code>rtl/fletcher4.sv</code>, <code>rtl/ram_1r1w.sv</code></td><td>ZFS Fletcher-4; block RAM primitive</td></tr><tr><td><code>tb/tb_comp.svh</code></td><td>Compression tests (included by <code>tb_top.sv</code>)</td></tr><tr><td><code>tb/unit/tb_codec.sv</code>, <code>scripts/codec_test.py</code></td><td>Codec unit tests against Python zlib</td></tr><tr><td><code>scripts/gen_zvec.py</code></td><td>zlib streams from software for the system test</td></tr><tr><td><code>docs/compression_spec.md</code></td><td>Opcodes, dword layouts, CRB, status codes, slots</td></tr><tr><td><code>rtl/nvme_identify.sv</code></td><td>Identify data, generated by <code>scripts/gen_identify.py</code></td></tr><tr><td><code>tb/tb_top.sv</code></td><td>Root-complex model + NVMe host driver, self-checking</td></tr><tr><td><code>tb/axi_mem_model.sv</code></td><td>AXI4 DDR model with random stalls</td></tr><tr><td><code>sim/run_xsim.sh</code></td><td>Compile and run with Vivado xsim</td></tr><tr><td><code>fpga/zc706/</code></td><td>Board build: <code>zc706_top.sv</code>, <code>zc706.xdc</code>, <code>gen_ip.tcl</code> (pcie_7x + MIG IP), <code>build.tcl</code> (bitstream)</td></tr><tr><td><code>scripts/pcie_check.py</code></td><td>Hardware: full-namespace write / read-back / compare through the Linux block device</td></tr><tr><td><code>scripts/ffe_hwtest.py</code></td><td>Hardware: FFE-Send / FFE-Receive compress and decompress through Linux NVMe passthrough</td></tr><tr><td><code>scripts/staging_hwtest.py</code></td><td>Hardware: two-phase write (81h + 84h) and Decompress-Read (86h) through VFIO</td></tr></tbody></table>
+<h2 id="running-the-simulation">Running the simulation</h2>
+<pre><code>source /path/to/Xilinx/2026.1/Vivado/settings64.sh
+cd ~/ramdisk/sim
+./run_xsim.sh          # batch; prints TEST PASSED / TEST FAILED
+./run_xsim.sh waves    # also records waves.wdb (open with: xsim waves.wdb -gui)
+./run_xsim.sh gui      # interactive</code></pre>
+<p>Or with Verilator (5.x, uses <code>--timing</code>):</p>
+<pre><code>cd ~/ramdisk/sim
+./run_verilator.sh            # build + run; prints TEST PASSED / TEST FAILED
+./run_verilator.sh waves      # also dumps waves.vcd (open with: gtkwave waves.vcd)
+./run_verilator.sh seeds 50   # run 50 random seeds
+SEED=7 ./run_verilator.sh     # one specific seed
+REC=20 ./run_verilator.sh     # build with 1 MB records (also: REC=20 ./run_xsim.sh)
+python3 ../scripts/codec_test.py [--big]   # deflate / inflate unit tests against zlib</code></pre>
+<p>The testbench brings the controller up the way the Linux <code>nvme</code> driver does (CAP/VS reads, admin queue, CC.EN, Identify, Set Features, create I/O queues), then runs error cases and about 90 reads/writes with random sizes, PRP1 offsets, PRP2 and chained PRP lists on two I/O queues. Every read is compared against a disk model. Completions to the controller's reads are split at 64 B boundaries and interleaved across tags; the TX interface and the DDR model apply random backpressure.</p>
+<h2 id="fpga-build-out-of-context">FPGA build (out of context)</h2>
+<pre><code>cd ~/ramdisk/fpga
+vivado -mode batch -source ooc_build.tcl -tclargs 17 route 8.0    # 128 KB build, 125 MHz
+vivado -mode batch -source ooc_build.tcl -tclargs 20 route 8.0    # 1 MB build</code></pre>
+<p>Reports land in <code>fpga/reports_rec&lt;N&gt;/</code>. <code>fpga/quick_mod.tcl</code> runs one module for timing work.</p>
+<table><thead><tr><th>Build</th><th>LUTs</th><th>Flip-flops</th><th>RAMB36</th><th>WNS at 8 ns</th></tr></thead><tbody><tr><td>128 KB records</td><td>28,756 (13%)</td><td>16,596 (4%)</td><td>50 (9%)</td><td>+0.154 ns</td></tr><tr><td>1 MB records</td><td>33,068 (15%)</td><td>37,937 (9%)</td><td>50 (9%)</td><td>+0.297 ns</td></tr></tbody></table>
+<h2 id="testing-on-the-board">Testing on the board</h2>
+<p>Build and boot: <code>cd fpga/zc706 &amp;&amp; vivado -mode batch -source build.tcl</code>, then <code>./boot/make_boot.sh</code> and copy <code>boot/work/BOOT.bin</code> to the SD card as <code>BOOT.BIN</code>. The board boots from SD. The SODIMM (MT8JTF12864HZ-1G6G1) only calibrates at DDR3-800, which is what the build uses.</p>
+<p>Check that the host sees it:</p>
+<pre><code>lspci -nn -d 10ee:                              # Non-Volatile memory controller [10ee:7024]
+cat /sys/bus/pci/devices/0000:08:00.0/current_link_{speed,width}   # 5.0 GT/s PCIe, 4
+lsblk -o NAME,SIZE,MODEL | grep ZC706           # nvme1n1  960M ZC706 NVMe RAM Disk</code></pre>
+<p>If the controller does not come up, reset the function and rebind it:</p>
+<pre><code>echo 1 | sudo tee /sys/bus/pci/devices/0000:08:00.0/reset
+echo 0000:08:00.0 | sudo tee /sys/bus/pci/drivers/nvme/bind</code></pre>
+<p>The scripts need root, and <code>sudo</code> needs a terminal to ask for the password (it will not run from a <code>!</code> command in Claude Code). Run them in a normal terminal.</p>
+<table><thead><tr><th>Script</th><th>What it does</th><th>Destructive</th></tr></thead><tbody><tr><td><code>sudo python3 scripts/pcie_check.py [/dev/nvme1n1] [--mib N]</code></td><td>O_DIRECT sequential write of a seeded pattern in 1 MiB I/Os, timed read-back with byte compare, then 4000 random-offset, random-size (4-256 KB) round-trips. Compares PCI status / DevSta / LnkSta and the kernel log before and after</td><td>Whole namespace, or the first N MiB</td></tr><tr><td><code>sudo python3 scripts/ffe_hwtest.py [/dev/nvme1]</code></td><td>FFE-Send / FFE-Receive (82h compress, 83h decompress) against Python zlib, LBA destination and source, error codes, rates</td><td>LBAs &gt;= 200000</td></tr><tr><td><code>sudo python3 scripts/staging_hwtest.py [0000:08:00.0]</code></td><td>Two-phase write and Decompress-Read; see <a href="docs/compression_spec.html#testing-on-hardware">docs/compression_spec.md</a></td><td>LBAs &gt;= 200000</td></tr></tbody></table>
+<p>Each prints <code>PASS</code> or <code>FAIL</code> at the end and exits non-zero on failure.</p>
+<p>Results on 2026-11-26 (host: Intel root port 8086:7a30, Linux 7.0.0-44):</p>
+<table><thead><tr><th>Test</th><th>Result</th></tr></thead><tbody><tr><td>Link</td><td>5.0 GT/s x4 (the maximum of both ends)</td></tr><tr><td><code>pcie_check.py</code>, 960 MiB</td><td>PASS: 0 mismatched chunks, 0 of 4000 random round-trips, no new kernel messages, PCI status unchanged</td></tr><tr><td>Sequential write, QD1, 1 MiB</td><td>304 MiB/s (includes generating the pattern in Python)</td></tr><tr><td>Sequential read, QD1, 1 MiB</td><td>701 MiB/s</td></tr><tr><td><code>staging_hwtest.py</code></td><td>PASS: 349 of 349 checks</td></tr><tr><td>Stage + commit, 128 KB text</td><td>50.5 MB/s (2.6 ms per record, one command at a time, polled from Python)</td></tr><tr><td>Decompress-Read, 128 KB text</td><td>31.1 MB/s (4.2 ms per record)</td></tr></tbody></table>
+<h2 id="pcie-core-settings">PCIe core settings</h2>
+<p><code>pcie_7x</code> settings the RTL assumes (used by <code>fpga/zc706/gen_ip.tcl</code>):</p>
+<ul><li>Gen2 (5.0 GT/s) x4, 128-bit AXI-Stream interface, 125 MHz</li><li>BAR0: 64-bit memory BAR, 16 KB, not prefetchable; no other BARs</li><li>Class code <code>0x010802</code> (mass storage / NVM / NVMe)</li><li>MSI-X capability: table size 5, table in BAR0 at offset 0x2000, PBA in BAR0 at 0x3000; MSI off</li><li>Vendor/device IDs of your choice (Identify reports VID/SSVID 0x10EE)</li></ul>
+<p>Connect <code>user_clk_out</code> / <code>user_reset_out</code> to <code>clk</code> / <code>rst</code>, <code>cfg_bus_number</code>, <code>cfg_device_number</code>, <code>cfg_function_number</code>, <code>cfg_interrupt_msixenable</code> and <code>cfg_interrupt_msixfm</code>. The AXI4 master goes through an AXI clock converter and interconnect to the MIG DDR3 SODIMM controller.</p>
+<h2 id="known-limits-and-assumptions">Known limits and assumptions</h2>
+<ul><li><strong>Payload byte order</strong> of the 7-series AXI-Stream interface is assumed little-endian per DW. If register writes or data come out byte-swapped on hardware, set <code>PAYLOAD_BSWAP = 1</code>.</li><li>No SGLs, no Write Zeroes / Dataset Management, no Compare; ONCS = 0.</li><li>Get Log Page ignores the log page offset.</li><li>Only physically contiguous queues (CAP.CQR = 1).</li><li>A controller reset finishes the command in progress before CSTS.RDY clears.</li><li>One command at a time: performance is not tuned yet. A compress blocks other I/O while it runs.</li><li>Compression uses fixed Huffman codes only: text compresses to about 29% (zlib level 6: 12%). On the board the test's word-list text gives 33% (zlib level 6: 15%), and 128 KB of zeros gives 1280 bytes (zlib: 149). A dynamic-Huffman encoder is the next ratio step.</li><li>Compress-to-Staging (81h) and Decompress-Read (86h) use MPTR. The Linux <code>nvme</code> driver does not pass a metadata buffer on a namespace without metadata, so they can only be sent from a user-space driver (VFIO, SPDK) or a kernel module. FFE-Send / FFE-Receive work through the standard passthrough ioctls.</li><li>Two correctable Receiver Errors (physical layer) are logged at the upstream root port when the link retrains after a function reset, for example when the board moves between <code>vfio-pci</code> and <code>nvme</code>. None were seen during data transfers.</li><li>The internal datapath moves 8 bytes per cycle: about 1 GB/s each way at 125 MHz, below the ~1.6 GB/s the link can carry. Widening the DMA paths to 4 DWs would close the gap.</li><li>Engines run at about 65 MB/s (deflate) and 70 MB/s (inflate) at 125 MHz, below the 200-250 MB/s target; match finding and Huffman decoding are bit- / byte-serial.</li><li>Staging slots are freed by Commit, FFE-Receive, Commit with DISCARD or a controller reset; there is no timeout yet.</li><li>FFE subset: at most 8 descriptors in the first page of PRP1, one source and one function, object-level CU, no PI, no partial object, compaction or filter; parameter data a 128-byte multiple.</li></ul>
+<footer>Generated from <code>README.md</code> by <code>scripts/md2html.py</code>.</footer>
+</body>
+</html>

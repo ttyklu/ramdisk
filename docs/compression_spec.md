@@ -143,3 +143,80 @@ stored bytes for an 82h with no LBA destination), and frees the List ID's slot.
 
 82h takes an inline source (the record). 83h takes an inline or LBA source (the zlib
 stream); with an LBA source its length is NLB blocks and the stream end marks CSIZE.
+
+## Using it from a host
+
+1. Enable compression: Set Features FID C0h, CDW11 = 1 (CEN = 1, RECSZ = 0 for 128 KB
+   records). Get Features C0h returns NSLOT in bits 31:16 (128 on the 128 KB build). Standard
+   Read / Write keep working in both modes; the namespace stays RAW until CEN is set.
+2. Two-phase write of one record:
+   * **81h Compress-to-Staging** with the record in PRP1/PRP2, CDW10 = LSIZE, CDW11 = threshold
+     (0 = ZFS rule) and MPTR pointing at a 64-byte host buffer. CQE DW0 has the handle and INCOMP;
+     the Result Record at MPTR has CSIZE, PSIZE, Fletcher-4 and Adler-32.
+   * Allocate PSIZE / 4 KB blocks, then **84h Commit** with that SLBA, NLB = PSIZE / 4 KB - 1 and
+     the handle. Several records can be staged before any is committed (up to NSLOT), and they
+     can be committed in any order. Commit with DISCARD (CDW13 bit 31) drops a record. A Commit
+     with the wrong NLB is refused with Invalid Field and the record stays staged.
+3. Read a compressed record back with **86h Decompress-Read**: SLBA, NLB, CSIZE and ULEN from the
+   Result Record, and MPTR pointing at that same record (the device takes the expected
+   Fletcher-4 from offset 10h), or CDW15 bit 0 (NOCHK) to skip the check. An incompressible
+   record (INCOMP) is stored raw: read it with a plain Read.
+4. Set CEN = 0 again to go back to RAW. A controller reset (CC.EN 1 -> 0) also returns to RAW and
+   frees every slot.
+
+**MPTR and Linux.** 81h and 86h need MPTR, and the Linux `nvme` driver will not map a metadata
+buffer for a passthrough command on a namespace that has no metadata (the ioctl is refused).
+From Linux, either use the FFE commands (89h / 8Ah return the CRB in the data buffer and work
+through `NVME_IOCTL_IO_CMD`), or drive the controller from user space through VFIO, as
+`scripts/staging_hwtest.py` does.
+
+## Testing on hardware
+
+| Script | Covers | Path to the board |
+| --- | --- | --- |
+| `scripts/ffe_hwtest.py` | FFE-Send / FFE-Receive: 82h compress, 83h decompress (inline and LBA source / destination), software zlib streams at levels 0, 1, 6, 9, error codes, rates | Linux `nvme` driver, passthrough ioctls on `/dev/nvme1` |
+| `scripts/staging_hwtest.py` | 81h, 84h, 86h: the two-phase write and Decompress-Read | `vfio-pci`, polled user-space NVMe driver |
+
+```bash
+sudo python3 scripts/staging_hwtest.py              # finds the 10ee board; or pass 0000:08:00.0
+sudo python3 scripts/staging_hwtest.py --keep-vfio  # leave it on vfio-pci afterwards
+```
+
+`staging_hwtest.py` moves the board to `vfio-pci`, which needs the board alone in its IOMMU
+group and IOMMU enabled (Intel VT-d / AMD-Vi). The script then sets up the admin queue and one
+I/O queue pair (64 entries, no interrupts) and maps 4 MiB of DMA memory at IOVA 0x1000_0000.
+At the end it disables compression, clears CC.EN and rebinds the board to `nvme`.
+It refuses to run if a namespace of the board is mounted, and writes only LBAs >= 200000. It
+checks:
+
+* 81h and 84h refused with Command Sequence Error while RAW
+* For zeros, text, runs and random records of 512 B, 4 KB, 13.5 KB, 64 KB and 128 KB:
+  * the CQE handle and INCOMP, and the Result Record: VALID, LSIZE, PSIZE = CSIZE rounded up to
+    4 KB, Adler-32 and the ZFS 12.5% rule
+  * after Commit, a plain Read of the extent: Fletcher-4 matches the record, Python's
+    `zlib.decompress` of the stored stream gives back the record, the padding is zero (or the
+    raw data for INCOMP), and the block after the extent is untouched
+  * 86h Decompress-Read of the extent returns the record
+* Threshold percent on both sides of the boundary `CSIZE x 100 <= LSIZE x T`
+* 8 records staged at once (distinct handles), committed in reverse order, all verified
+* Errors:
+  * bad LSIZE (0, not a 512 multiple, above the record size)
+  * NLB too large, then the right NLB succeeds
+  * freed handle, handle >= NSLOT, LBA range
+  * DISCARD, then the handle is gone
+  * Staging Full after exactly NSLOT staged records, and the slots free again after discards
+  * wrong Fletcher-4 (C2h), NOCHK, ULEN short (C4h)
+* 128 KB stage + commit and Decompress-Read rates
+
+Results on 2026-11-26 (ZC706, 128 KB build): **349 of 349 checks passed.**
+
+| Record | 512 B | 4 KB | 13.5 KB | 64 KB | 128 KB | zlib level 6, 128 KB |
+| --- | --- | --- | --- | --- | --- | --- |
+| zeros, CSIZE | 13 | 48 | 143 | 645 | 1280 | 149 |
+| text, CSIZE | 221 | 1409 | 4630 | 21924 | 43679 (3.00x) | 19539 |
+| runs, CSIZE | 25 | 97 | 366 | 1767 | 3783 | 2905 |
+| random | INCOMP | INCOMP | INCOMP | INCOMP | INCOMP | (larger than input) |
+
+Stage + commit of 128 KB text ran at 50.5 MB/s (2.6 ms per record) and Decompress-Read at
+31.1 MB/s (4.2 ms per record). These are one command at a time, polled from Python, so they
+are lower bounds, not the engines' throughput.

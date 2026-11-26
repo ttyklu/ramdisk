@@ -1,4 +1,4 @@
-# ZC706 NVMe RAM Disk — round 2 (RTL + simulation, with compression)
+# ZC706 NVMe RAM Disk (with hardware compression)
 
 A hardware NVMe controller for the ZC706 that serves a namespace out of DDR3. No ARM
 firmware is involved: admin and I/O commands are handled entirely in the FPGA fabric.
@@ -11,7 +11,13 @@ Interface: [docs/compression_spec.md](docs/compression_spec.md).
 for 128 KB records (20/20 random seeds) and the optional 1 MB build. The deflate / inflate
 engines also pass 494 unit checks against Python's zlib. Out-of-context place and route on the
 ZC706 part (xc7z045ffg900-2) meets timing at 125 MHz for both builds (WNS +0.15 ns at 128 KB,
-+0.30 ns at 1 MB). Not yet integrated with the PCIe / MIG IP or tried on hardware.
++0.30 ns at 1 MB).
+
+**On hardware** (ZC706, `fpga/zc706/`, DDR3-800): the board enumerates under the Linux 7.0
+`nvme` driver as `nvme1n1` (960 MiB, 4 KB blocks) and trains at Gen2 x4. The whole namespace
+reads back byte-for-byte with no PCIe errors (`scripts/pcie_check.py`), and the two-phase
+compressed write, Decompress-Read and their error cases pass 349 of 349 checks
+(`scripts/staging_hwtest.py`). See [Testing on the board](#testing-on-the-board).
 
 ## What is implemented
 
@@ -75,6 +81,10 @@ are pipelined.
 | `tb/tb_top.sv` | Root-complex model + NVMe host driver, self-checking |
 | `tb/axi_mem_model.sv` | AXI4 DDR model with random stalls |
 | `sim/run_xsim.sh` | Compile and run with Vivado xsim |
+| `fpga/zc706/` | Board build: `zc706_top.sv`, `zc706.xdc`, `gen_ip.tcl` (pcie_7x + MIG IP), `build.tcl` (bitstream) |
+| `scripts/pcie_check.py` | Hardware: full-namespace write / read-back / compare through the Linux block device |
+| `scripts/ffe_hwtest.py` | Hardware: FFE-Send / FFE-Receive compress and decompress through Linux NVMe passthrough |
+| `scripts/staging_hwtest.py` | Hardware: two-phase write (81h + 84h) and Decompress-Read (86h) through VFIO |
 
 ## Running the simulation
 
@@ -120,9 +130,54 @@ Reports land in `fpga/reports_rec<N>/`. `fpga/quick_mod.tcl` runs one module for
 | 128 KB records | 28,756 (13%) | 16,596 (4%) | 50 (9%) | +0.154 ns |
 | 1 MB records | 33,068 (15%) | 37,937 (9%) | 50 (9%) | +0.297 ns |
 
-## Hardware integration (next round)
+## Testing on the board
 
-`pcie_7x` settings the RTL assumes:
+Build and boot: `cd fpga/zc706 && vivado -mode batch -source build.tcl`, then
+`./boot/make_boot.sh` and copy `boot/work/BOOT.bin` to the SD card as `BOOT.BIN`. The board
+boots from SD. The SODIMM
+(MT8JTF12864HZ-1G6G1) only calibrates at DDR3-800, which is what the build uses.
+
+Check that the host sees it:
+
+```bash
+lspci -nn -d 10ee:                              # Non-Volatile memory controller [10ee:7024]
+cat /sys/bus/pci/devices/0000:08:00.0/current_link_{speed,width}   # 5.0 GT/s PCIe, 4
+lsblk -o NAME,SIZE,MODEL | grep ZC706           # nvme1n1  960M ZC706 NVMe RAM Disk
+```
+
+If the controller does not come up, reset the function and rebind it:
+
+```bash
+echo 1 | sudo tee /sys/bus/pci/devices/0000:08:00.0/reset
+echo 0000:08:00.0 | sudo tee /sys/bus/pci/drivers/nvme/bind
+```
+
+The scripts need root, and `sudo` needs a terminal to ask for the password (it will not run
+from a `!` command in Claude Code). Run them in a normal terminal.
+
+| Script | What it does | Destructive |
+| --- | --- | --- |
+| `sudo python3 scripts/pcie_check.py [/dev/nvme1n1] [--mib N]` | O_DIRECT sequential write of a seeded pattern in 1 MiB I/Os, timed read-back with byte compare, then 4000 random-offset, random-size (4-256 KB) round-trips. Compares PCI status / DevSta / LnkSta and the kernel log before and after | Whole namespace, or the first N MiB |
+| `sudo python3 scripts/ffe_hwtest.py [/dev/nvme1]` | FFE-Send / FFE-Receive (82h compress, 83h decompress) against Python zlib, LBA destination and source, error codes, rates | LBAs >= 200000 |
+| `sudo python3 scripts/staging_hwtest.py [0000:08:00.0]` | Two-phase write and Decompress-Read; see [docs/compression_spec.md](docs/compression_spec.md#testing-on-hardware) | LBAs >= 200000 |
+
+Each prints `PASS` or `FAIL` at the end and exits non-zero on failure.
+
+Results on 2026-11-26 (host: Intel root port 8086:7a30, Linux 7.0.0-44):
+
+| Test | Result |
+| --- | --- |
+| Link | 5.0 GT/s x4 (the maximum of both ends) |
+| `pcie_check.py`, 960 MiB | PASS: 0 mismatched chunks, 0 of 4000 random round-trips, no new kernel messages, PCI status unchanged |
+| Sequential write, QD1, 1 MiB | 304 MiB/s (includes generating the pattern in Python) |
+| Sequential read, QD1, 1 MiB | 701 MiB/s |
+| `staging_hwtest.py` | PASS: 349 of 349 checks |
+| Stage + commit, 128 KB text | 50.5 MB/s (2.6 ms per record, one command at a time, polled from Python) |
+| Decompress-Read, 128 KB text | 31.1 MB/s (4.2 ms per record) |
+
+## PCIe core settings
+
+`pcie_7x` settings the RTL assumes (used by `fpga/zc706/gen_ip.tcl`):
 
 - Gen2 (5.0 GT/s) x4, 128-bit AXI-Stream interface, 125 MHz
 - BAR0: 64-bit memory BAR, 16 KB, not prefetchable; no other BARs
@@ -145,7 +200,15 @@ interconnect to the MIG DDR3 SODIMM controller.
 - A controller reset finishes the command in progress before CSTS.RDY clears.
 - One command at a time: performance is not tuned yet. A compress blocks other I/O while it runs.
 - Compression uses fixed Huffman codes only: text compresses to about 29% (zlib level 6: 12%).
-  A dynamic-Huffman encoder is the next ratio step.
+  On the board the test's word-list text gives 33% (zlib level 6: 15%), and 128 KB of zeros
+  gives 1280 bytes (zlib: 149). A dynamic-Huffman encoder is the next ratio step.
+- Compress-to-Staging (81h) and Decompress-Read (86h) use MPTR. The Linux `nvme` driver does not
+  pass a metadata buffer on a namespace without metadata, so they can only be sent from a
+  user-space driver (VFIO, SPDK) or a kernel module. FFE-Send / FFE-Receive work through the
+  standard passthrough ioctls.
+- Two correctable Receiver Errors (physical layer) are logged at the upstream root port when the
+  link retrains after a function reset, for example when the board moves between `vfio-pci` and
+  `nvme`. None were seen during data transfers.
 - The internal datapath moves 8 bytes per cycle: about 1 GB/s each way at 125 MHz, below the
   ~1.6 GB/s the link can carry. Widening the DMA paths to 4 DWs would close the gap.
 - Engines run at about 65 MB/s (deflate) and 70 MB/s (inflate) at 125 MHz, below the
